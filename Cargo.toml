@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+axon-httpfile = { path = "crates/axon-httpfile" }
+axon-netrc = { path = "crates/axon-netrc" }
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "cookies", "http2", "rustls-tls"] }
+serde_json = { version = "1", features = ["preserve_order"] }

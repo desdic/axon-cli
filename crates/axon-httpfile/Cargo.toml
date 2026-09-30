@@ -1,0 +1,8 @@
+[package]
+name = "axon-httpfile"
+version.workspace = true
+edition.workspace = true
+description = "Parser for .http request files with variable substitution"
+
+[dependencies]
+anyhow.workspace = true

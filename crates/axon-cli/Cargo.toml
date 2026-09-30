@@ -1,0 +1,14 @@
+[package]
+name = "axon-cli"
+version.workspace = true
+edition.workspace = true
+description = "Runs named requests from a .http file, authenticating via .netrc, and prints the responses curl-style, or as JSON"
+
+[dependencies]
+axon-httpfile.workspace = true
+axon-netrc.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true

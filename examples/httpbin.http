@@ -1,0 +1,62 @@
+# Example requests against https://httpbin.org, which echoes what it receives.
+#
+#   axon-cli -f examples/httpbin.http                        # list requests
+#   axon-cli -f examples/httpbin.http -l                     # list names only
+#   axon-cli -f examples/httpbin.http -n get                 # run one
+#   axon-cli -f examples/httpbin.http -n "set cookie" -n "read cookies"
+#   axon-cli -f examples/httpbin.http -n "basic auth" --netrc-file examples/netrc
+
+@host = httpbin.org
+@base = https://{{host}}
+@user = demo
+
+### get
+GET {{base}}/get?source=axon-cli
+Accept: application/json
+
+### create item
+POST {{base}}/post
+Content-Type: application/json
+X-Trace: {{$env USER}}
+
+{
+  "name": "widget",
+  "owner": "{{user}}"
+}
+
+### Update (renamed below)
+# @name update item
+PUT {{base}}/put HTTP/1.1
+Content-Type: text/plain
+
+plain text body
+
+### delete
+// URL-only lines default to GET, so the method is spelled out here.
+delete {{base}}/delete
+
+### basic auth
+# Credentials come from netrc: run with --netrc-file examples/netrc.
+GET {{base}}/basic-auth/{{user}}/s3cret
+
+### set cookie
+# Redirects to /cookies; add --no-follow to see the 302 itself.
+GET {{base}}/cookies/set?flavor=oatmeal
+
+### read cookies
+# Run after "set cookie" in the same invocation to see the cookie sent back.
+GET {{base}}/cookies
+
+### redirect
+GET {{base}}/redirect/2
+
+### teapot
+# 4xx/5xx still exit 0; check .status.code.
+GET {{base}}/status/418
+
+### html
+GET {{base}}/html
+
+### binary
+# Non-UTF-8 bodies come back base64-encoded.
+GET {{base}}/bytes/16
