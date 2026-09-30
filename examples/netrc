@@ -1,0 +1,2 @@
+# Demo credentials for the "basic auth" request in httpbin.http.
+machine httpbin.org login demo password s3cret

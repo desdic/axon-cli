@@ -1,0 +1,5 @@
+[package]
+name = "axon-netrc"
+version.workspace = true
+edition.workspace = true
+description = "Minimal .netrc parser and credential lookup"
