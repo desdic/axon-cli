@@ -207,8 +207,8 @@ fn lists_requests_without_name() {
     assert_eq!(
         r.stdout,
         json!([
-            { "index": 1, "name": "first", "method": "GET", "url": "https://{{host}}/a" },
-            { "index": 2, "name": "second", "method": "POST", "url": "https://{{host}}/b" },
+            { "index": 1, "name": "first", "method": "GET", "url": "https://{{host}}/a", "start_line": 2, "end_line": 4 },
+            { "index": 2, "name": "second", "method": "POST", "url": "https://{{host}}/b", "start_line": 5, "end_line": 9 },
         ])
     );
 }
