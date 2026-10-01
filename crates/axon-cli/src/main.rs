@@ -100,7 +100,14 @@ fn run(args: Args) -> Result<Output> {
             file.requests
                 .iter()
                 .zip(1..)
-                .map(|(r, index)| json!({ "index": index, "name": r.name, "method": r.method, "url": r.url }))
+                .map(|(r, index)| json!({
+                    "index": index,
+                    "name": r.name,
+                    "method": r.method,
+                    "url": r.url,
+                    "start_line": r.start_line,
+                    "end_line": r.end_line,
+                }))
                 .collect(),
         ));
     }
