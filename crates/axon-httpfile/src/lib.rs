@@ -19,29 +19,42 @@ pub struct Request {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Option<String>,
+    /// 1-based lines of the request's block: from its `###` separator (or the
+    /// start of the file) up to the line before the next separator.
+    pub start_line: usize,
+    pub end_line: usize,
 }
 
 pub fn parse(contents: &str) -> Result<HttpFile> {
     let mut file = HttpFile { variables: Vec::new(), requests: Vec::new() };
     let mut block = Vec::new();
     let mut name = None;
+    let mut start = 1;
+    let mut last = 0;
     for (index, line) in contents.lines().enumerate() {
+        last = index + 1;
         if let Some(rest) = line.strip_prefix("###") {
-            file.parse_block(name.take(), &block)?;
+            file.parse_block(name.take(), (start, last - 1), &block)?;
             block.clear();
             name = clean_name(rest);
+            start = last;
         } else {
-            block.push((index + 1, line));
+            block.push((last, line));
         }
     }
-    file.parse_block(name, &block)?;
+    file.parse_block(name, (start, last), &block)?;
     Ok(file)
 }
 
 impl HttpFile {
     /// Parses the lines between two `###` separators. A block without a
     /// request line (e.g. only variables or comments) adds no request.
-    fn parse_block(&mut self, mut name: Option<String>, lines: &[(usize, &str)]) -> Result<()> {
+    fn parse_block(
+        &mut self,
+        mut name: Option<String>,
+        (start_line, end_line): (usize, usize),
+        lines: &[(usize, &str)],
+    ) -> Result<()> {
         let mut lines = lines.iter();
 
         // Variables, comments and `# @name`, up to the request line.
@@ -106,6 +119,8 @@ impl HttpFile {
             url: url.to_string(),
             headers,
             body: (!body.is_empty()).then(|| body.join("\n")),
+            start_line,
+            end_line,
         });
         Ok(())
     }
@@ -124,6 +139,8 @@ impl HttpFile {
                 .map(|(name, value)| Ok((sub(name)?, sub(value)?)))
                 .collect::<Result<_>>()?,
             body: request.body.as_deref().map(sub).transpose()?,
+            start_line: request.start_line,
+            end_line: request.end_line,
         })
     }
 
@@ -218,13 +235,15 @@ fn clean_name(name: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn request(name: Option<&str>, method: &str, url: &str) -> Request {
+    fn request(name: Option<&str>, method: &str, url: &str, (start_line, end_line): (usize, usize)) -> Request {
         Request {
             name: name.map(Into::into),
             method: method.into(),
             url: url.into(),
             headers: Vec::new(),
             body: None,
+            start_line,
+            end_line,
         }
     }
 
@@ -238,15 +257,25 @@ mod tests {
         let file = parse("### one\nGET http://a/1\n\n### two\nPOST http://a/2\n").unwrap();
         assert_eq!(
             file.requests,
-            [request(Some("one"), "GET", "http://a/1"), request(Some("two"), "POST", "http://a/2")]
+            [request(Some("one"), "GET", "http://a/1", (1, 3)), request(Some("two"), "POST", "http://a/2", (4, 5))]
         );
     }
 
     #[test]
     fn request_before_first_separator() {
         let file = parse("GET http://a/0\n### one\nGET http://a/1\n").unwrap();
-        assert_eq!(file.requests[0], request(None, "GET", "http://a/0"));
+        assert_eq!(file.requests[0], request(None, "GET", "http://a/0", (1, 1)));
         assert_eq!(file.requests[1].name.as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn line_ranges_cover_whole_blocks() {
+        let file = parse(
+            "@host = a\n\n### one\nPUT http://a\n\n{}\n# trailing comment\n\n### two\n// comment\nGET http://b\n### empty\n",
+        )
+        .unwrap();
+        let ranges: Vec<_> = file.requests.iter().map(|r| (r.start_line, r.end_line)).collect();
+        assert_eq!(ranges, [(3, 8), (9, 11)]);
     }
 
     #[test]
@@ -269,13 +298,13 @@ mod tests {
     #[test]
     fn url_only_defaults_to_get() {
         let file = parse("http://a/x\n").unwrap();
-        assert_eq!(file.requests[0], request(None, "GET", "http://a/x"));
+        assert_eq!(file.requests[0], request(None, "GET", "http://a/x", (1, 1)));
     }
 
     #[test]
     fn method_is_uppercased_and_version_ignored() {
         let file = parse("patch http://a/x HTTP/1.1\n").unwrap();
-        assert_eq!(file.requests[0], request(None, "PATCH", "http://a/x"));
+        assert_eq!(file.requests[0], request(None, "PATCH", "http://a/x", (1, 1)));
     }
 
     #[test]

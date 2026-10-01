@@ -55,7 +55,7 @@ axon-cli -f api.http -n "create item" -n "list items" --json | jq -r '.[1].body'
 
 ### Output
 
-Listing prints `[{"index", "name", "method", "url"}]` (URLs as written, before substitution; `name` is `null` for an unnamed request); `-l` prints `["name", ...]`, with `"#N"` in place of an unnamed request, so every entry can be passed to `-n` (listing is always JSON).
+Listing prints `[{"index", "name", "method", "url", "start_line", "end_line"}]` (URLs as written, before substitution; `name` is `null` for an unnamed request; `start_line`..`end_line` are the 1-based lines of the request's block, from its `###` up to the next one); `-l` prints `["name", ...]`, with `"#N"` in place of an unnamed request, so every entry can be passed to `-n` (listing is always JSON).
 
 Running requests prints, for each response, the status line and headers prefixed with `< ` like `curl -v`, a `< ` line, then the body as raw bytes exactly as received (no trailing newline added):
 
