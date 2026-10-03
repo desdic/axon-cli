@@ -37,8 +37,15 @@ fn parse(contents: &str) -> Vec<Entry<'_>> {
         match token {
             "machine" | "default" => {
                 entries.extend(current.take());
-                let machine = if token == "machine" { tokens.next() } else { None };
-                current = Some(Entry { machine, ..Default::default() });
+                let machine = if token == "machine" {
+                    tokens.next()
+                } else {
+                    None
+                };
+                current = Some(Entry {
+                    machine,
+                    ..Default::default()
+                });
             }
             "login" | "password" | "account" => {
                 let value = tokens.next();
@@ -85,7 +92,10 @@ mod tests {
     use super::*;
 
     fn creds(login: &str, password: Option<&str>) -> Option<Credentials> {
-        Some(Credentials { login: login.into(), password: password.map(Into::into) })
+        Some(Credentials {
+            login: login.into(),
+            password: password.map(Into::into),
+        })
     }
 
     #[test]
@@ -96,7 +106,10 @@ mod tests {
 
     #[test]
     fn host_match_is_case_insensitive() {
-        assert_eq!(lookup("machine Example.COM login u password p", "example.com"), creds("u", Some("p")));
+        assert_eq!(
+            lookup("machine Example.COM login u password p", "example.com"),
+            creds("u", Some("p"))
+        );
     }
 
     #[test]
@@ -113,7 +126,10 @@ mod tests {
 
     #[test]
     fn no_match() {
-        assert_eq!(lookup("machine a.com login alice password one", "b.com"), None);
+        assert_eq!(
+            lookup("machine a.com login alice password one", "b.com"),
+            None
+        );
     }
 
     #[test]

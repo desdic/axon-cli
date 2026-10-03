@@ -63,7 +63,10 @@ enum Output {
 fn main() -> ExitCode {
     match run(Args::parse()) {
         Ok(Output::Json(output)) => {
-            println!("{}", serde_json::to_string_pretty(&output).expect("JSON value serializes"));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&output).expect("JSON value serializes")
+            );
             ExitCode::SUCCESS
         }
         Ok(Output::Raw(body)) => {
@@ -71,7 +74,10 @@ fn main() -> ExitCode {
             match stdout.write_all(&body).and_then(|()| stdout.flush()) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
-                    eprintln!("{}", json!({ "error": format!("failed to write body: {err}") }));
+                    eprintln!(
+                        "{}",
+                        json!({ "error": format!("failed to write body: {err}") })
+                    );
                     ExitCode::FAILURE
                 }
             }
@@ -85,14 +91,19 @@ fn main() -> ExitCode {
 
 fn run(args: Args) -> Result<Output> {
     let path = &args.file;
-    let contents =
-        std::fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let file = httpfile::parse(&contents).with_context(|| format!("failed to parse {}", path.display()))?;
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let file = httpfile::parse(&contents)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
 
     if args.list {
         // An unnamed request is listed as the `#N` that selects it with -n.
         return Ok(Output::Json(
-            file.requests.iter().zip(1..).map(|(r, index)| r.name.clone().unwrap_or(format!("#{index}"))).collect(),
+            file.requests
+                .iter()
+                .zip(1..)
+                .map(|(r, index)| r.name.clone().unwrap_or(format!("#{index}")))
+                .collect(),
         ));
     }
     if args.names.is_empty() {
@@ -100,22 +111,32 @@ fn run(args: Args) -> Result<Output> {
             file.requests
                 .iter()
                 .zip(1..)
-                .map(|(r, index)| json!({
-                    "index": index,
-                    "name": r.name,
-                    "method": r.method,
-                    "url": r.url,
-                    "start_line": r.start_line,
-                    "end_line": r.end_line,
-                }))
+                .map(|(r, index)| {
+                    json!({
+                        "index": index,
+                        "name": r.name,
+                        "method": r.method,
+                        "url": r.url,
+                        "start_line": r.start_line,
+                        "end_line": r.end_line,
+                    })
+                })
                 .collect(),
         ));
     }
 
     let netrc = read_netrc(args.netrc_file.as_deref())?;
     let client = Client::builder()
-        .user_agent(concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")))
-        .redirect(if args.no_follow { Policy::none() } else { Policy::default() })
+        .user_agent(concat!(
+            env!("CARGO_PKG_NAME"),
+            "/",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .redirect(if args.no_follow {
+            Policy::none()
+        } else {
+            Policy::default()
+        })
         .cookie_store(true)
         .build()?;
 
@@ -133,12 +154,14 @@ fn run(args: Args) -> Result<Output> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let responses = requests.into_iter().map(|(selector, index, name, request)| {
-        request
-            .send()
-            .with_context(|| format!("request \"{selector}\""))
-            .map(|response| (selector, index, name, response))
-    });
+    let responses = requests
+        .into_iter()
+        .map(|(selector, index, name, request)| {
+            request
+                .send()
+                .with_context(|| format!("request \"{selector}\""))
+                .map(|response| (selector, index, name, response))
+        });
 
     if !args.json {
         let mut output = Vec::new();
@@ -148,28 +171,42 @@ fn run(args: Args) -> Result<Output> {
             if !args.body && output.last().is_some_and(|&byte| byte != b'\n') {
                 output.push(b'\n');
             }
-            render_raw(&mut output, response, !args.body).with_context(|| format!("request \"{selector}\""))?;
+            render_raw(&mut output, response, !args.body)
+                .with_context(|| format!("request \"{selector}\""))?;
         }
         return Ok(Output::Raw(output));
     }
 
     let mut responses = responses
-        .map(|response| response.and_then(|(_, index, name, response)| render(index, name.as_deref(), response)))
+        .map(|response| {
+            response.and_then(|(_, index, name, response)| render(index, name.as_deref(), response))
+        })
         .collect::<Result<Vec<_>>>()?;
-    Ok(Output::Json(if responses.len() == 1 { responses.remove(0) } else { Value::Array(responses) }))
+    Ok(Output::Json(if responses.len() == 1 {
+        responses.remove(0)
+    } else {
+        Value::Array(responses)
+    }))
 }
 
 /// Finds the one request with this exact name or, failing that, the request
 /// at a 1-based `#N` index, returning it with its index.
-fn select<'a>(requests: &'a [httpfile::Request], selector: &str) -> Result<(usize, &'a httpfile::Request)> {
-    let mut matches = (1..).zip(requests).filter(|(_, r)| r.name.as_deref() == Some(selector));
+fn select<'a>(
+    requests: &'a [httpfile::Request],
+    selector: &str,
+) -> Result<(usize, &'a httpfile::Request)> {
+    let mut matches = (1..)
+        .zip(requests)
+        .filter(|(_, r)| r.name.as_deref() == Some(selector));
     if let Some(found) = matches.next() {
         if matches.next().is_some() {
             bail!("more than one request is named \"{selector}\"");
         }
         return Ok(found);
     }
-    let index = selector.strip_prefix('#').filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    let index = selector
+        .strip_prefix('#')
+        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
     let Some(index) = index else {
         bail!("no request named \"{selector}\"");
     };
@@ -177,10 +214,19 @@ fn select<'a>(requests: &'a [httpfile::Request], selector: &str) -> Result<(usiz
         .parse::<usize>()
         .ok()
         .and_then(|index| Some((index, requests.get(index.checked_sub(1)?)?)))
-        .with_context(|| format!("no request {selector} (the file has {} requests)", requests.len()))
+        .with_context(|| {
+            format!(
+                "no request {selector} (the file has {} requests)",
+                requests.len()
+            )
+        })
 }
 
-fn build(client: &Client, request: httpfile::Request, netrc: Option<&str>) -> Result<RequestBuilder> {
+fn build(
+    client: &Client,
+    request: httpfile::Request,
+    netrc: Option<&str>,
+) -> Result<RequestBuilder> {
     let url = Url::parse(&request.url).with_context(|| format!("invalid URL: {}", request.url))?;
     let method = Method::from_bytes(request.method.as_bytes())
         .with_context(|| format!("invalid method: {}", request.method))?;
@@ -190,7 +236,9 @@ fn build(client: &Client, request: httpfile::Request, netrc: Option<&str>) -> Re
     let credentials = if headers.contains_key(AUTHORIZATION) || !url.username().is_empty() {
         None
     } else {
-        netrc.zip(url.host_str()).and_then(|(contents, host)| netrc::lookup(contents, host))
+        netrc
+            .zip(url.host_str())
+            .and_then(|(contents, host)| netrc::lookup(contents, host))
     };
 
     let mut builder = client.request(method, url).headers(headers);
@@ -206,8 +254,10 @@ fn build(client: &Client, request: httpfile::Request, netrc: Option<&str>) -> Re
 fn parse_headers(raw: &[(String, String)]) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     for (name, value) in raw {
-        let name = HeaderName::from_bytes(name.as_bytes()).with_context(|| format!("invalid header name: {name}"))?;
-        let value = HeaderValue::from_str(value).with_context(|| format!("invalid header value: {value}"))?;
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .with_context(|| format!("invalid header name: {name}"))?;
+        let value = HeaderValue::from_str(value)
+            .with_context(|| format!("invalid header value: {value}"))?;
         headers.append(name, value);
     }
     Ok(headers)
@@ -273,7 +323,10 @@ fn raw_head(response: &Response) -> String {
     }
     head.push('\n');
     for (name, value) in response.headers() {
-        head.push_str(&format!("< {name}: {}\n", String::from_utf8_lossy(value.as_bytes())));
+        head.push_str(&format!(
+            "< {name}: {}\n",
+            String::from_utf8_lossy(value.as_bytes())
+        ));
     }
     head.push_str("< \n");
     head

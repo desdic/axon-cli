@@ -26,7 +26,10 @@ pub struct Request {
 }
 
 pub fn parse(contents: &str) -> Result<HttpFile> {
-    let mut file = HttpFile { variables: Vec::new(), requests: Vec::new() };
+    let mut file = HttpFile {
+        variables: Vec::new(),
+        requests: Vec::new(),
+    };
     let mut block = Vec::new();
     let mut name = None;
     let mut start = 1;
@@ -74,7 +77,8 @@ impl HttpFile {
                 let Some((var, value)) = variable.split_once('=') else {
                     bail!("line {line_no}: invalid variable (expected \"@name = value\"): {line}");
                 };
-                self.variables.push((var.trim().to_string(), value.trim().to_string()));
+                self.variables
+                    .push((var.trim().to_string(), value.trim().to_string()));
             } else {
                 break (line_no, line);
             }
@@ -87,7 +91,9 @@ impl HttpFile {
         let (method, url) = match parts[..] {
             [url] => ("GET", url),
             [method, url] => (method, url),
-            _ => bail!("line {line_no}: invalid request line (expected \"METHOD URL [HTTP-version]\"): {request_line}"),
+            _ => bail!(
+                "line {line_no}: invalid request line (expected \"METHOD URL [HTTP-version]\"): {request_line}"
+            ),
         };
 
         // Headers up to the first blank line, then the body.
@@ -164,11 +170,15 @@ impl HttpFile {
 
     fn lookup(&self, name: &str, visible: usize) -> Result<String> {
         if let Some(dynamic) = name.strip_prefix('$') {
-            let Some(var) = dynamic.strip_prefix("env").filter(|v| v.starts_with(char::is_whitespace)) else {
+            let Some(var) = dynamic
+                .strip_prefix("env")
+                .filter(|v| v.starts_with(char::is_whitespace))
+            else {
                 bail!("unsupported dynamic variable: {{{{{name}}}}}");
             };
             let var = var.trim();
-            return std::env::var(var).with_context(|| format!("environment variable not set: {var}"));
+            return std::env::var(var)
+                .with_context(|| format!("environment variable not set: {var}"));
         }
         // A redefined variable takes its latest earlier definition.
         let index = self.variables[..visible]
@@ -235,7 +245,12 @@ fn clean_name(name: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn request(name: Option<&str>, method: &str, url: &str, (start_line, end_line): (usize, usize)) -> Request {
+    fn request(
+        name: Option<&str>,
+        method: &str,
+        url: &str,
+        (start_line, end_line): (usize, usize),
+    ) -> Request {
         Request {
             name: name.map(Into::into),
             method: method.into(),
@@ -257,7 +272,10 @@ mod tests {
         let file = parse("### one\nGET http://a/1\n\n### two\nPOST http://a/2\n").unwrap();
         assert_eq!(
             file.requests,
-            [request(Some("one"), "GET", "http://a/1", (1, 3)), request(Some("two"), "POST", "http://a/2", (4, 5))]
+            [
+                request(Some("one"), "GET", "http://a/1", (1, 3)),
+                request(Some("two"), "POST", "http://a/2", (4, 5))
+            ]
         );
     }
 
@@ -274,13 +292,20 @@ mod tests {
             "@host = a\n\n### one\nPUT http://a\n\n{}\n# trailing comment\n\n### two\n// comment\nGET http://b\n### empty\n",
         )
         .unwrap();
-        let ranges: Vec<_> = file.requests.iter().map(|r| (r.start_line, r.end_line)).collect();
+        let ranges: Vec<_> = file
+            .requests
+            .iter()
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
         assert_eq!(ranges, [(3, 8), (9, 11)]);
     }
 
     #[test]
     fn name_directive_overrides_separator_name() {
-        let file = parse("### Separator name\n# @name real\nGET http://a\n### x\n// @name other\nGET http://b\n").unwrap();
+        let file = parse(
+            "### Separator name\n# @name real\nGET http://a\n### x\n// @name other\nGET http://b\n",
+        )
+        .unwrap();
         assert_eq!(file.requests[0].name.as_deref(), Some("real"));
         assert_eq!(file.requests[1].name.as_deref(), Some("other"));
     }
@@ -292,7 +317,15 @@ mod tests {
         )
         .unwrap();
         let names: Vec<_> = file.requests.iter().map(|r| r.name.as_deref()).collect();
-        assert_eq!(names, [Some("Set options"), Some("real"), Some("Fetch http://c"), None]);
+        assert_eq!(
+            names,
+            [
+                Some("Set options"),
+                Some("real"),
+                Some("Fetch http://c"),
+                None
+            ]
+        );
     }
 
     #[test]
@@ -304,7 +337,10 @@ mod tests {
     #[test]
     fn method_is_uppercased_and_version_ignored() {
         let file = parse("patch http://a/x HTTP/1.1\n").unwrap();
-        assert_eq!(file.requests[0], request(None, "PATCH", "http://a/x", (1, 1)));
+        assert_eq!(
+            file.requests[0],
+            request(None, "PATCH", "http://a/x", (1, 1))
+        );
     }
 
     #[test]
@@ -314,7 +350,13 @@ mod tests {
         )
         .unwrap();
         let r = &file.requests[0];
-        assert_eq!(r.headers, [("Content-Type".into(), "application/json".into()), ("X-A".into(), "1".into())]);
+        assert_eq!(
+            r.headers,
+            [
+                ("Content-Type".into(), "application/json".into()),
+                ("X-A".into(), "1".into())
+            ]
+        );
         assert_eq!(r.body.as_deref(), Some("{\n  \"k\": 1\n}"));
     }
 
@@ -327,7 +369,9 @@ mod tests {
 
     #[test]
     fn block_without_request_is_skipped() {
-        let file = parse("@host = a\n### only a comment\n# nothing here\n### real\nGET http://{{host}}\n").unwrap();
+        let file =
+            parse("@host = a\n### only a comment\n# nothing here\n### real\nGET http://{{host}}\n")
+                .unwrap();
         assert_eq!(file.requests.len(), 1);
         assert_eq!(file.requests[0].name.as_deref(), Some("real"));
     }
@@ -335,13 +379,19 @@ mod tests {
     #[test]
     fn invalid_header_reports_line() {
         let err = parse("GET http://a\nno colon here\n").err().unwrap();
-        assert_eq!(err.to_string(), "line 2: invalid header (expected \"Name: Value\"): no colon here");
+        assert_eq!(
+            err.to_string(),
+            "line 2: invalid header (expected \"Name: Value\"): no colon here"
+        );
     }
 
     #[test]
     fn invalid_request_line() {
         let err = parse("GET http://a extra\n").err().unwrap();
-        assert!(err.to_string().starts_with("line 1: invalid request line"), "{err}");
+        assert!(
+            err.to_string().starts_with("line 1: invalid request line"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -354,13 +404,16 @@ mod tests {
 
     #[test]
     fn variables_reference_earlier_variables() {
-        let r = resolved("@host = example.com\n@base = https://{{host}}/api\nGET {{base}}/items\n").unwrap();
+        let r = resolved("@host = example.com\n@base = https://{{host}}/api\nGET {{base}}/items\n")
+            .unwrap();
         assert_eq!(r.url, "https://example.com/api/items");
     }
 
     #[test]
     fn variable_cannot_reference_later_variable() {
-        let err = resolved("@base = https://{{host}}\n@host = a\nGET {{base}}\n").err().unwrap();
+        let err = resolved("@base = https://{{host}}\n@host = a\nGET {{base}}\n")
+            .err()
+            .unwrap();
         assert_eq!(err.to_string(), "undefined variable: host");
     }
 
@@ -385,8 +438,13 @@ mod tests {
 
     #[test]
     fn unset_env_variable() {
-        let err = resolved("GET http://a/{{$env AXON_CLI_SURELY_UNSET}}\n").err().unwrap();
-        assert_eq!(err.to_string(), "environment variable not set: AXON_CLI_SURELY_UNSET");
+        let err = resolved("GET http://a/{{$env AXON_CLI_SURELY_UNSET}}\n")
+            .err()
+            .unwrap();
+        assert_eq!(
+            err.to_string(),
+            "environment variable not set: AXON_CLI_SURELY_UNSET"
+        );
     }
 
     #[test]
