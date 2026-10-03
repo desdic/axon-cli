@@ -53,18 +53,39 @@ fn handle(stream: TcpStream) {
         headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
     }
     let header_values = |name: &str| -> Vec<String> {
-        headers.iter().filter(|(n, _)| n == name).map(|(_, v)| v.clone()).collect()
+        headers
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+            .collect()
     };
 
-    let length = header_values("content-length").first().map_or(0, |v| v.parse().unwrap());
+    let length = header_values("content-length")
+        .first()
+        .map_or(0, |v| v.parse().unwrap());
     let mut body = vec![0; length];
     reader.read_exact(&mut body).unwrap();
 
     let (status, extra_header, content_type, payload) = match path.as_str() {
-        "/redirect" => ("302 Found", Some("Location: /json"), "text/plain", Vec::new()),
+        "/redirect" => (
+            "302 Found",
+            Some("Location: /json"),
+            "text/plain",
+            Vec::new(),
+        ),
         "/text" => ("200 OK", None, "text/plain", b"hello text".to_vec()),
-        "/bin" => ("200 OK", None, "application/octet-stream", vec![0x00, 0xff, 0xfe]),
-        "/raw" => ("200 OK", None, "application/json", b"{ \"b\": 1,\n  \"a\": [1.0, 2e3] }\n".to_vec()),
+        "/bin" => (
+            "200 OK",
+            None,
+            "application/octet-stream",
+            vec![0x00, 0xff, 0xfe],
+        ),
+        "/raw" => (
+            "200 OK",
+            None,
+            "application/json",
+            b"{ \"b\": 1,\n  \"a\": [1.0, 2e3] }\n".to_vec(),
+        ),
         "/missing" => ("404 Not Found", None, "text/plain", b"not found".to_vec()),
         _ => {
             let echo = json!({
@@ -75,7 +96,12 @@ fn handle(stream: TcpStream) {
                 "x_test": header_values("x-test"),
                 "body": String::from_utf8_lossy(&body),
             });
-            ("200 OK", None, "application/json", echo.to_string().into_bytes())
+            (
+                "200 OK",
+                None,
+                "application/json",
+                echo.to_string().into_bytes(),
+            )
         }
     };
 
@@ -136,8 +162,12 @@ fn run_in(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> Run {
         if bytes.is_empty() {
             Value::Null
         } else {
-            serde_json::from_slice(bytes)
-                .unwrap_or_else(|e| panic!("{stream} is not JSON ({e}): {}", String::from_utf8_lossy(bytes)))
+            serde_json::from_slice(bytes).unwrap_or_else(|e| {
+                panic!(
+                    "{stream} is not JSON ({e}): {}",
+                    String::from_utf8_lossy(bytes)
+                )
+            })
         }
     };
     Run {
@@ -252,11 +282,17 @@ fn json_response_shape() {
     assert_eq!(r.stdout["url"], url);
     assert_eq!(r.stdout["version"], "HTTP/1.1");
     assert_eq!(r.stdout["status"], json!({ "code": 200, "reason": "OK" }));
-    assert_eq!(r.stdout["headers"]["content-type"], json!(["application/json"]));
+    assert_eq!(
+        r.stdout["headers"]["content-type"],
+        json!(["application/json"])
+    );
     assert_eq!(r.stdout["body_base64"], Value::Null);
     assert_eq!(r.echo("method"), "GET");
     assert_eq!(r.echo("authorization"), Value::Null);
-    assert_eq!(r.echo("user_agent"), format!("axon-cli/{}", env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        r.echo("user_agent"),
+        format!("axon-cli/{}", env!("CARGO_PKG_VERSION"))
+    );
 }
 
 #[test]
@@ -337,7 +373,10 @@ fn http_error_status_exits_zero() {
     let r = run_request("404", &format!("GET {base}/missing"));
 
     assert_eq!(r.code, 0);
-    assert_eq!(r.stdout["status"], json!({ "code": 404, "reason": "Not Found" }));
+    assert_eq!(
+        r.stdout["status"],
+        json!({ "code": 404, "reason": "Not Found" })
+    );
     assert_eq!(r.stdout["body"], "not found");
 }
 
@@ -352,7 +391,10 @@ fn run_body(test: &str, contents: &str, args: &[&str]) -> (i32, Vec<u8>) {
         .env("HOME", temp_dir("empty-home"))
         .output()
         .unwrap();
-    (output.status.code().expect("process exited normally"), output.stdout)
+    (
+        output.status.code().expect("process exited normally"),
+        output.stdout,
+    )
 }
 
 /// The `< ` header block the test server sends with every response.
@@ -370,23 +412,37 @@ fn raw_head(status: &str, content_type: &str, length: usize) -> String {
 
 /// Splits raw output after the `< ` header block, returning the body.
 fn raw_body(stdout: &[u8]) -> &[u8] {
-    let end = stdout.windows(3).position(|w| w == b"< \n").expect("header block ends with \"< \"");
+    let end = stdout
+        .windows(3)
+        .position(|w| w == b"< \n")
+        .expect("header block ends with \"< \"");
     &stdout[end + 3..]
 }
 
 #[test]
 fn prints_headers_and_raw_body_by_default() {
     let base = start_server();
-    let (code, stdout) = run_body("body-text", &format!("### r\nGET {base}/text\n"), &["-n", "r"]);
+    let (code, stdout) = run_body(
+        "body-text",
+        &format!("### r\nGET {base}/text\n"),
+        &["-n", "r"],
+    );
 
     assert_eq!(code, 0);
-    assert_eq!(String::from_utf8(stdout).unwrap(), raw_head("200 OK", "text/plain", 10) + "hello text");
+    assert_eq!(
+        String::from_utf8(stdout).unwrap(),
+        raw_head("200 OK", "text/plain", 10) + "hello text"
+    );
 }
 
 #[test]
 fn raw_json_body_is_unreformatted() {
     let base = start_server();
-    let (code, stdout) = run_body("body-raw", &format!("### r\nGET {base}/raw\n"), &["-n", "r"]);
+    let (code, stdout) = run_body(
+        "body-raw",
+        &format!("### r\nGET {base}/raw\n"),
+        &["-n", "r"],
+    );
 
     assert_eq!(code, 0);
     assert_eq!(raw_body(&stdout), b"{ \"b\": 1,\n  \"a\": [1.0, 2e3] }\n");
@@ -395,7 +451,11 @@ fn raw_json_body_is_unreformatted() {
 #[test]
 fn raw_binary_body_is_written_as_is() {
     let base = start_server();
-    let (code, stdout) = run_body("body-bin", &format!("### r\nGET {base}/bin\n"), &["-n", "r"]);
+    let (code, stdout) = run_body(
+        "body-bin",
+        &format!("### r\nGET {base}/bin\n"),
+        &["-n", "r"],
+    );
 
     assert_eq!(code, 0);
     assert_eq!(raw_body(&stdout), [0x00, 0xff, 0xfe]);
@@ -421,7 +481,11 @@ fn several_raw_responses_print_in_order_on_separate_lines() {
 #[test]
 fn body_option_prints_only_raw_body() {
     let base = start_server();
-    let (code, stdout) = run_body("body-only", &format!("### r\nGET {base}/raw\n"), &["-n", "r", "-b"]);
+    let (code, stdout) = run_body(
+        "body-only",
+        &format!("### r\nGET {base}/raw\n"),
+        &["-n", "r", "-b"],
+    );
 
     assert_eq!(code, 0);
     assert_eq!(stdout, b"{ \"b\": 1,\n  \"a\": [1.0, 2e3] }\n");
@@ -442,7 +506,11 @@ fn body_option_concatenates_several_bodies_as_sent() {
 
 #[test]
 fn body_option_conflicts_with_json() {
-    let (code, stdout) = run_body("body-json", "### a\nGET http://x/\n", &["-n", "a", "-b", "--json"]);
+    let (code, stdout) = run_body(
+        "body-json",
+        "### a\nGET http://x/\n",
+        &["-n", "a", "-b", "--json"],
+    );
 
     assert_eq!(code, 2);
     assert!(stdout.is_empty());
@@ -453,7 +521,10 @@ fn listing_is_json_without_json_option() {
     let (code, stdout) = run_body("raw-list", "### a\nGET http://x/\n", &["-l"]);
 
     assert_eq!(code, 0);
-    assert_eq!(serde_json::from_slice::<Value>(&stdout).unwrap(), json!(["a"]));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&stdout).unwrap(),
+        json!(["a"])
+    );
 }
 
 // --- redirects -------------------------------------------------------------
@@ -470,10 +541,17 @@ fn redirects_are_followed() {
 #[test]
 fn no_follow_returns_redirect() {
     let base = start_server();
-    let r = run_file("no-follow", &format!("### r\nGET {base}/redirect\n"), &["-n", "r", "--no-follow"]);
+    let r = run_file(
+        "no-follow",
+        &format!("### r\nGET {base}/redirect\n"),
+        &["-n", "r", "--no-follow"],
+    );
 
     assert_eq!(r.stdout["url"], format!("{base}/redirect"));
-    assert_eq!(r.stdout["status"], json!({ "code": 302, "reason": "Found" }));
+    assert_eq!(
+        r.stdout["status"],
+        json!({ "code": 302, "reason": "Found" })
+    );
     assert_eq!(r.stdout["headers"]["location"], json!(["/json"]));
 }
 
@@ -511,7 +589,10 @@ fn method_is_case_insensitive_and_version_is_accepted() {
 #[test]
 fn request_can_set_user_agent() {
     let base = start_server();
-    let r = run_request("user-agent", &format!("GET {base}/json\nUser-Agent: custom/1"));
+    let r = run_request(
+        "user-agent",
+        &format!("GET {base}/json\nUser-Agent: custom/1"),
+    );
 
     assert_eq!(r.echo("user_agent"), "custom/1");
 }
@@ -527,7 +608,11 @@ fn file_and_env_variables() {
             "@base = {base}\n@url = {{{{base}}}}/json\n### r\nPOST {{{{url}}}}\nX-Test: {{{{$env AXON_CLI_TEST_VAR}}}}\n\nurl={{{{ url }}}}\n"
         ),
     );
-    let r = run_in(&temp_dir("empty-home"), &["-f", &file, "-n", "r"], &[("AXON_CLI_TEST_VAR", "from env")]);
+    let r = run_in(
+        &temp_dir("empty-home"),
+        &["-f", &file, "-n", "r"],
+        &[("AXON_CLI_TEST_VAR", "from env")],
+    );
 
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert_eq!(r.stdout["url"], format!("{base}/json"));
@@ -556,7 +641,11 @@ fn several_names_run_in_order_given() {
 #[test]
 fn name_directive_selects_request() {
     let base = start_server();
-    let r = run_file("name-directive", &format!("### Some title\n# @name real\nGET {base}/json\n"), &["-n", "real"]);
+    let r = run_file(
+        "name-directive",
+        &format!("### Some title\n# @name real\nGET {base}/json\n"),
+        &["-n", "real"],
+    );
 
     assert_eq!(r.code, 0);
     assert_eq!(r.stdout["name"], "real");
@@ -567,7 +656,9 @@ fn index_selects_request_named_or_not() {
     let base = start_server();
     let r = run_file(
         "index",
-        &format!("@x = 1\n###\n// only a comment\nGET {base}/json\n\n### create\nPOST {base}/json\n"),
+        &format!(
+            "@x = 1\n###\n// only a comment\nGET {base}/json\n\n### create\nPOST {base}/json\n"
+        ),
         &["-n", "#2", "-n", "#1", "-n", "create"],
     );
 
@@ -584,7 +675,11 @@ fn index_selects_request_named_or_not() {
 #[test]
 fn exact_name_wins_over_index() {
     let base = start_server();
-    let r = run_file("index-name", &format!("### a\nGET {base}/json\n\n### #1\nPOST {base}/json\n"), &["-n", "#1"]);
+    let r = run_file(
+        "index-name",
+        &format!("### a\nGET {base}/json\n\n### #1\nPOST {base}/json\n"),
+        &["-n", "#1"],
+    );
 
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert_eq!(r.stdout["index"], 2);
@@ -614,7 +709,11 @@ fn cookies_are_shared_between_requests() {
 #[test]
 fn netrc_from_default_home_location() {
     let base = start_server();
-    let r = run_with_netrc("netrc-home", "machine 127.0.0.1 login alice password s3cret\n", &format!("GET {base}/json"));
+    let r = run_with_netrc(
+        "netrc-home",
+        "machine 127.0.0.1 login alice password s3cret\n",
+        &format!("GET {base}/json"),
+    );
 
     assert_eq!(r.echo("authorization"), basic("alice", "s3cret"));
 }
@@ -648,7 +747,11 @@ fn netrc_default_entry_is_fallback() {
 #[test]
 fn netrc_without_matching_machine_sends_no_auth() {
     let base = start_server();
-    let r = run_with_netrc("netrc-no-match", "machine other.example login x password y\n", &format!("GET {base}/json"));
+    let r = run_with_netrc(
+        "netrc-no-match",
+        "machine other.example login x password y\n",
+        &format!("GET {base}/json"),
+    );
 
     assert_eq!(r.echo("authorization"), Value::Null);
 }
@@ -669,7 +772,11 @@ fn authorization_header_overrides_netrc() {
 fn url_credentials_override_netrc() {
     let base = start_server();
     let url = format!("{}/json", base.replace("http://", "http://bob:pw@"));
-    let r = run_with_netrc("netrc-vs-url", "machine 127.0.0.1 login alice password s3cret\n", &format!("GET {url}"));
+    let r = run_with_netrc(
+        "netrc-vs-url",
+        "machine 127.0.0.1 login alice password s3cret\n",
+        &format!("GET {url}"),
+    );
 
     assert_eq!(r.echo("authorization"), basic("bob", "pw"));
 }
@@ -679,12 +786,21 @@ fn url_credentials_override_netrc() {
 fn assert_error(r: &Run, message_contains: &str) {
     assert_eq!(r.code, 1);
     assert_eq!(r.stdout, Value::Null);
-    let message = r.stderr["error"].as_str().expect("stderr has an error string");
-    assert!(message.contains(message_contains), "unexpected error: {message}");
+    let message = r.stderr["error"]
+        .as_str()
+        .expect("stderr has an error string");
+    assert!(
+        message.contains(message_contains),
+        "unexpected error: {message}"
+    );
 }
 
 fn refused_url() -> String {
-    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     format!("http://127.0.0.1:{port}/json")
 }
 
@@ -698,7 +814,11 @@ fn connection_refused() {
 #[test]
 fn unknown_name_is_reported_before_sending() {
     // `a` would fail to connect; the unknown name must be reported instead.
-    let r = run_file("unknown-name", &format!("### a\nGET {}\n", refused_url()), &["-n", "a", "-n", "nope"]);
+    let r = run_file(
+        "unknown-name",
+        &format!("### a\nGET {}\n", refused_url()),
+        &["-n", "a", "-n", "nope"],
+    );
 
     assert_error(&r, "no request named \"nope\"");
 }
@@ -706,7 +826,11 @@ fn unknown_name_is_reported_before_sending() {
 #[test]
 fn index_out_of_range() {
     for index in ["#0", "#3", "#99999999999999999999999"] {
-        let r = run_file("index-range", "### a\nGET http://x/1\n\n### b\nGET http://x/2\n", &["-n", index]);
+        let r = run_file(
+            "index-range",
+            "### a\nGET http://x/1\n\n### b\nGET http://x/2\n",
+            &["-n", index],
+        );
 
         assert_error(&r, &format!("no request {index} (the file has 2 requests)"));
     }
@@ -715,7 +839,11 @@ fn index_out_of_range() {
 #[test]
 fn malformed_index_is_a_name() {
     for selector in ["#", "#+1", "#1a", "1"] {
-        let r = run_file("index-malformed", "### a\nGET http://x/1\n", &["-n", selector]);
+        let r = run_file(
+            "index-malformed",
+            "### a\nGET http://x/1\n",
+            &["-n", selector],
+        );
 
         assert_error(&r, &format!("no request named \"{selector}\""));
     }
@@ -723,7 +851,11 @@ fn malformed_index_is_a_name() {
 
 #[test]
 fn duplicate_name() {
-    let r = run_file("duplicate-name", "### a\nGET http://x/1\n\n### a\nGET http://x/2\n", &["-n", "a"]);
+    let r = run_file(
+        "duplicate-name",
+        "### a\nGET http://x/1\n\n### a\nGET http://x/2\n",
+        &["-n", "a"],
+    );
 
     assert_error(&r, "more than one request is named \"a\"");
 }
@@ -744,7 +876,11 @@ fn undefined_variable() {
 
 #[test]
 fn missing_http_file() {
-    let r = run_in(&temp_dir("empty-home"), &["-f", "/nonexistent/requests.http"], &[]);
+    let r = run_in(
+        &temp_dir("empty-home"),
+        &["-f", "/nonexistent/requests.http"],
+        &[],
+    );
 
     assert_error(&r, "failed to read /nonexistent/requests.http");
 }
