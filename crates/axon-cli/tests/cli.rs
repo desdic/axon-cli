@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 /// - `/text`     → plain-text body
 /// - `/bin`      → non-UTF-8 body
 /// - `/missing`  → 404
+/// - `/list`     → JSON with arrays to loop over
 /// - anything else → JSON echo of the request (method, authorization, cookie,
 ///   user-agent, x-test, body)
 ///
@@ -87,6 +88,13 @@ fn handle(stream: TcpStream) {
             b"{ \"b\": 1,\n  \"a\": [1.0, 2e3] }\n".to_vec(),
         ),
         "/missing" => ("404 Not Found", None, "text/plain", b"not found".to_vec()),
+        "/list" => (
+            "200 OK",
+            None,
+            "application/json",
+            br#"{"users":[{"id":1,"name":"ann"},{"id":2,"name":"bob"}],"empty":[],"one":"x"}"#
+                .to_vec(),
+        ),
         _ => {
             let echo = json!({
                 "method": method,
@@ -702,6 +710,334 @@ fn cookies_are_shared_between_requests() {
     let mut sent: Vec<_> = cookie.as_str().unwrap().split("; ").collect();
     sent.sort();
     assert_eq!(sent, ["session=abc123", "theme=dark"]);
+}
+
+// --- response chaining -----------------------------------------------------
+
+/// `login` posts a token that the echo server returns in its body; `me` and
+/// `again` reference that response, directly and through a file variable.
+/// `BASE` stands for the server URL.
+const CHAIN: &str = "\
+@token = {{login.response.body.$.body}}
+### login
+POST BASE/json
+
+tok123
+
+### me
+GET BASE/json
+Authorization: Bearer {{token}}
+X-Test: {{ login.response.headers.Content-Type }}
+X-Test: {{login.response.body.$.x_test}}
+
+### again
+GET BASE/json
+X-Test: {{login.response.body.$.method}}
+";
+
+fn chain(base: &str) -> String {
+    CHAIN.replace("BASE", base)
+}
+
+/// How many responses the default output printed.
+fn response_count(stdout: &[u8]) -> usize {
+    stdout.windows(11).filter(|w| w == b"< HTTP/1.1 ").count()
+}
+
+#[test]
+fn chained_values_are_substituted() {
+    let base = start_server();
+    let r = run_file("chain-values", &chain(&base), &["-n", "me"]);
+
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.echo("authorization"), "Bearer tok123");
+    assert_eq!(r.echo("x_test"), json!(["application/json", "[]"]));
+}
+
+#[test]
+fn json_includes_only_selected_requests() {
+    let base = start_server();
+    let one = run_file("chain-json-one", &chain(&base), &["-n", "me"]);
+    assert_eq!(one.stdout["name"], "me");
+
+    let two = run_file(
+        "chain-json-two",
+        &chain(&base),
+        &["-n", "me", "-n", "again"],
+    );
+    assert_eq!(two.code, 0, "{}", two.stderr);
+    assert_eq!(two.stdout.as_array().unwrap().len(), 2);
+    assert_eq!(two.stdout[0]["name"], "me");
+    assert_eq!(two.stdout[1]["name"], "again");
+    assert_eq!(echo_field(&two.stdout[1], "x_test"), json!(["POST"]));
+}
+
+#[test]
+fn with_deps_includes_dependencies_in_order() {
+    let base = start_server();
+    let r = run_file(
+        "chain-with-deps",
+        &chain(&base),
+        &["-n", "me", "--with-deps"],
+    );
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let all = r
+        .stdout
+        .as_array()
+        .expect("--with-deps always prints an array");
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0]["name"], "login");
+    assert_eq!(all[0]["dependency"], true);
+    assert_eq!(all[1]["name"], "me");
+    assert!(all[1].get("dependency").is_none());
+
+    // A dependency that was already given with -n is not sent again.
+    let r = run_file(
+        "chain-with-deps-two",
+        &chain(&base),
+        &["-n", "login", "-n", "me", "--with-deps"],
+    );
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout.as_array().unwrap().len(), 2);
+    assert!(r.stdout[0].get("dependency").is_none());
+}
+
+#[test]
+fn with_deps_keeps_a_looping_request_in_one_slot() {
+    let base = start_server();
+    let r = run_file(
+        "loop-with-deps",
+        &loops(&base),
+        &["-n", "each", "--with-deps"],
+    );
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout[0]["name"], "list");
+    assert_eq!(r.stdout[0]["dependency"], true);
+    assert_eq!(r.stdout[1].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn default_output_includes_dependencies_run_once() {
+    let base = start_server();
+    for (args, expected) in [
+        (&["-n", "me"][..], 2),
+        (&["-n", "me", "-n", "again"][..], 3),
+        (&["-n", "login", "-n", "me"][..], 2),
+        // A request given with -n always runs, even after running as a dependency.
+        (&["-n", "me", "-n", "login"][..], 3),
+    ] {
+        let (code, stdout) = run_body("chain-default", &chain(&base), args);
+
+        assert_eq!(code, 0);
+        assert_eq!(response_count(&stdout), expected, "{args:?}");
+    }
+}
+
+#[test]
+fn body_option_prints_only_selected_requests() {
+    let base = start_server();
+    let (code, stdout) = run_body("chain-body", &chain(&base), &["-n", "me", "-b"]);
+
+    assert_eq!(code, 0);
+    let body: Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(body["authorization"], "Bearer tok123");
+}
+
+#[test]
+fn dependency_cycle_is_reported_before_sending() {
+    let url = refused_url();
+    let r = run_file(
+        "chain-cycle",
+        &format!(
+            "### a\nGET {url}?{{{{b.response.headers.X}}}}\n\n### b\nGET {url}?{{{{a.response.headers.X}}}}\n"
+        ),
+        &["-n", "a"],
+    );
+
+    assert_error(&r, "dependency cycle: a -> b -> a");
+}
+
+#[test]
+fn self_reference_is_reported() {
+    let r = run_request("chain-self", "GET http://x/{{r.response.headers.X}}");
+
+    assert_error(&r, "request \"r\" depends on itself");
+}
+
+#[test]
+fn unknown_dependency_is_reported_before_sending() {
+    let r = run_file(
+        "chain-unknown",
+        &format!(
+            "### a\nGET {}\n\n### me\nGET http://x/{{{{login.response.headers.X}}}}\n",
+            refused_url()
+        ),
+        &["-n", "a", "-n", "me"],
+    );
+
+    assert_error(&r, "no request named \"login\"");
+}
+
+#[test]
+fn invalid_reference_is_reported_before_sending() {
+    let r = run_file(
+        "chain-invalid",
+        &format!(
+            "### login\nGET {}\n\n### me\nGET http://x/{{{{login.response.body.token}}}}\n",
+            refused_url()
+        ),
+        &["-n", "me"],
+    );
+
+    assert_error(
+        &r,
+        "invalid response reference {{login.response.body.token}}",
+    );
+}
+
+#[test]
+fn missing_value_is_a_runtime_error() {
+    let base = start_server();
+    let r = run_file(
+        "chain-missing",
+        &format!(
+            "### login\nPOST {base}/json\n\n### me\nGET {base}/json\nX-Test: {{{{login.response.body.$.nope}}}}\n"
+        ),
+        &["-n", "me"],
+    );
+
+    assert_error(&r, "response body of \"login\" has no value at $.nope");
+}
+
+// --- loops -----------------------------------------------------------------
+
+/// `each` runs once per user from `list`; the others cover an empty array, a
+/// non-array, a missing element value, and a reference to a looping request.
+/// `BASE` stands for the server URL.
+const LOOPS: &str = "\
+### list
+GET BASE/list
+
+### each
+# @foreach user in {{list.response.body.$.users}}
+GET BASE/json
+X-Test: {{user.id}}-{{user.name}}
+X-Test: {{user}}
+
+### none
+# @foreach user in {{list.response.body.$.empty}}
+GET BASE/json
+
+### not array
+// @foreach user in {{list.response.body.$.one}}
+GET BASE/json
+
+### missing
+# @foreach user in {{list.response.body.$.users}}
+GET BASE/json
+X-Test: {{user.nope}}
+
+### uses each
+GET BASE/json
+X-Test: {{each.response.headers.content-type}}
+";
+
+fn loops(base: &str) -> String {
+    LOOPS.replace("BASE", base)
+}
+
+#[test]
+fn loop_runs_once_per_element() {
+    let base = start_server();
+    let r = run_file("loop-each", &loops(&base), &["-n", "each"]);
+
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let iterations = r.stdout.as_array().expect("a looping -n prints an array");
+    assert_eq!(iterations.len(), 2);
+    assert_eq!(
+        echo_field(&iterations[0], "x_test"),
+        json!(["1-ann", r#"{"id":1,"name":"ann"}"#])
+    );
+    assert_eq!(
+        echo_field(&iterations[1], "x_test"),
+        json!(["2-bob", r#"{"id":2,"name":"bob"}"#])
+    );
+}
+
+#[test]
+fn looping_request_takes_one_json_slot() {
+    let base = start_server();
+    let r = run_file(
+        "loop-slot",
+        &loops(&base),
+        &["-n", "list", "-n", "each", "-n", "none"],
+    );
+
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout.as_array().unwrap().len(), 3);
+    assert_eq!(r.stdout[0]["name"], "list");
+    assert_eq!(r.stdout[1].as_array().unwrap().len(), 2);
+    assert_eq!(r.stdout[1][0]["name"], "each");
+    assert_eq!(r.stdout[2], json!([]));
+}
+
+#[test]
+fn loop_default_and_body_output() {
+    let base = start_server();
+    let (code, stdout) = run_body("loop-default", &loops(&base), &["-n", "each"]);
+    assert_eq!(code, 0);
+    assert_eq!(response_count(&stdout), 3);
+
+    // An empty array sends nothing; only the dependency is printed.
+    let (code, stdout) = run_body("loop-empty", &loops(&base), &["-n", "none"]);
+    assert_eq!(code, 0);
+    assert_eq!(response_count(&stdout), 1);
+
+    let (code, stdout) = run_body("loop-body", &loops(&base), &["-n", "each", "-b"]);
+    assert_eq!(code, 0);
+    let text = String::from_utf8(stdout).unwrap();
+    assert_eq!(text.matches("\"x_test\"").count(), 2, "{text}");
+    assert!(!text.contains("\"users\""), "{text}");
+}
+
+#[test]
+fn loop_over_non_array_is_a_runtime_error() {
+    let base = start_server();
+    let r = run_file("loop-not-array", &loops(&base), &["-n", "not array"]);
+
+    assert_error(&r, "@foreach: {{list.response.body.$.one}} is not an array");
+}
+
+#[test]
+fn missing_element_value_names_the_element() {
+    let base = start_server();
+    let r = run_file("loop-missing", &loops(&base), &["-n", "missing"]);
+
+    assert_error(
+        &r,
+        "request \"missing\" (element 0): current element has no value at {{user.nope}}",
+    );
+}
+
+#[test]
+fn referencing_a_looping_request_is_reported_before_sending() {
+    let r = run_file(
+        "loop-reference",
+        &loops(&refused_url()),
+        &["-n", "uses each"],
+    );
+
+    assert_error(&r, "request \"each\" loops (@foreach)");
+}
+
+#[test]
+fn invalid_foreach_is_a_parse_error() {
+    let r = run_request(
+        "loop-invalid",
+        "# @foreach user {{a.response.body.$}}\nGET http://x/",
+    );
+
+    assert_error(&r, "line 2: invalid @foreach");
 }
 
 // --- netrc -----------------------------------------------------------------
