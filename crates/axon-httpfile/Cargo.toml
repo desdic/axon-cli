@@ -6,3 +6,4 @@ description = "Parser for .http request files with variable substitution"
 
 [dependencies]
 anyhow.workspace = true
+serde_json.workspace = true
