@@ -5,10 +5,17 @@
 #   axon-cli -f examples/httpbin.http -n get                 # run one
 #   axon-cli -f examples/httpbin.http -n "set cookie" -n "read cookies"
 #   axon-cli -f examples/httpbin.http -n "basic auth" --netrc-file examples/netrc
+#   axon-cli -f examples/httpbin.http -n "show item"         # runs "create item" first
+#   axon-cli -f examples/httpbin.http -n "each slide"        # runs "slides" first, then once per slide
+#   HTTPBIN_TOKEN=s3cret axon-cli -f examples/httpbin.http -n bearer
+#   axon-cli -f examples/httpbin.http -n environment -b | jq .headers
 
 @host = httpbin.org
 @base = https://{{host}}
 @user = demo
+# A file variable can read the environment; it is only needed (and checked)
+# when a request that uses it runs.
+@token = {{$env HTTPBIN_TOKEN}}
 
 ### get
 GET {{base}}/get?source=axon-cli
@@ -23,6 +30,37 @@ X-Trace: {{$env USER}}
   "name": "widget",
   "owner": "{{user}}"
 }
+
+### show item
+# Chaining: uses values from the "create item" response, so that request runs
+# first (once) when it has not run yet. httpbin echoes the posted JSON as "json".
+GET {{base}}/anything/{{create item.response.body.$.json.name}}
+Accept: {{create item.response.headers.Content-Type}}
+
+### slides
+# httpbin's sample JSON: {"slideshow": {"slides": [{"title": ..., "type": ...}, ...]}}
+GET {{base}}/json
+
+### each slide
+# Loops: runs once for each element of the array, with {{slide}} as the element.
+# @foreach slide in {{slides.response.body.$.slideshow.slides}}
+GET {{base}}/anything/slides/{{slide.type}}
+X-Slide-Title: {{slide.title}}
+
+### bearer
+# Token from the environment, through @token:
+#   HTTPBIN_TOKEN=s3cret axon-cli -f examples/httpbin.http -n bearer
+# Without HTTPBIN_TOKEN set, this fails before anything is sent.
+GET {{base}}/bearer
+Authorization: Bearer {{token}}
+
+### environment
+# {{$env NAME}} works directly in the URL, headers and body too.
+POST {{base}}/anything/{{$env USER}}
+X-Lang: {{$env LANG}}
+Content-Type: application/json
+
+{"user": "{{$env USER}}", "terminal": "{{$env TERM}}"}
 
 ### Update (renamed below)
 # @name update item

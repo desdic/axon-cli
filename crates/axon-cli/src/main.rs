@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -8,12 +9,11 @@ use axon_httpfile as httpfile;
 use axon_netrc as netrc;
 use base64::Engine;
 use clap::Parser;
-use reqwest::Method;
-use reqwest::Url;
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::cookie::Cookie;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use reqwest::redirect::Policy;
+use reqwest::{Method, StatusCode, Url, Version};
 use serde_json::{Map, Value, json};
 
 /// Runs named requests from a .http file, authenticating via .netrc, and prints
@@ -53,11 +53,18 @@ struct Args {
     /// Print only the raw response body, without the status line and headers
     #[arg(short, long, conflicts_with = "json")]
     body: bool,
+
+    /// With --json, also print the responses of requests run only as
+    /// dependencies, marked `"dependency": true`; the output is then always
+    /// an array of every response, in the order sent
+    #[arg(long, requires = "json")]
+    with_deps: bool,
 }
 
 enum Output {
     Json(Value),
-    Raw(Vec<u8>),
+    /// Responses already written to stdout as they arrived.
+    Written,
 }
 
 fn main() -> ExitCode {
@@ -69,19 +76,7 @@ fn main() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        Ok(Output::Raw(body)) => {
-            let mut stdout = std::io::stdout().lock();
-            match stdout.write_all(&body).and_then(|()| stdout.flush()) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(err) => {
-                    eprintln!(
-                        "{}",
-                        json!({ "error": format!("failed to write body: {err}") })
-                    );
-                    ExitCode::FAILURE
-                }
-            }
-        }
+        Ok(Output::Written) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("{}", json!({ "error": format!("{err:#}") }));
             ExitCode::FAILURE
@@ -125,6 +120,9 @@ fn run(args: Args) -> Result<Output> {
         ));
     }
 
+    // Plan every request to send and build each one that needs no earlier
+    // response, so bad input fails before anything is sent.
+    let mut steps = plan(&file, &args.names)?;
     let netrc = read_netrc(args.netrc_file.as_deref())?;
     let client = Client::builder()
         .user_agent(concat!(
@@ -140,53 +138,216 @@ fn run(args: Args) -> Result<Output> {
         .cookie_store(true)
         .build()?;
 
-    // Build every selected request before sending any, so bad input fails early.
-    let requests = args
-        .names
-        .iter()
-        .map(|selector| {
-            let (index, request) = select(&file.requests, selector)?;
-            let name = request.name.clone();
-            file.resolve(request)
+    let no_responses = HashMap::new();
+    for step in steps.iter_mut().filter(|step| !step.chained) {
+        step.builder = Some(
+            file.resolve(step.request, &no_responses, None)
                 .and_then(|request| build(&client, request, netrc.as_deref()))
-                .map(|builder| (selector, index, name, builder))
-                .with_context(|| format!("request \"{selector}\""))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let responses = requests
-        .into_iter()
-        .map(|(selector, index, name, request)| {
-            request
-                .send()
-                .with_context(|| format!("request \"{selector}\""))
-                .map(|response| (selector, index, name, response))
-        });
-
-    if !args.json {
-        let mut output = Vec::new();
-        for response in responses {
-            let (selector, _, _, response) = response?;
-            // Start each later header block on its own line; bare bodies stay as sent.
-            if !args.body && output.last().is_some_and(|&byte| byte != b'\n') {
-                output.push(b'\n');
-            }
-            render_raw(&mut output, response, !args.body)
-                .with_context(|| format!("request \"{selector}\""))?;
-        }
-        return Ok(Output::Raw(output));
+                .with_context(|| format!("request \"{}\"", step.label))?,
+        );
     }
 
-    let mut responses = responses
-        .map(|response| {
-            response.and_then(|(_, index, name, response)| render(index, name.as_deref(), response))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(Output::Json(if responses.len() == 1 {
-        responses.remove(0)
+    let mut responses = HashMap::new();
+    let mut json_output = Vec::new();
+    let mut stdout = std::io::stdout().lock();
+    let mut last_byte = None;
+    for mut step in steps {
+        let label = format!("request \"{}\"", step.label);
+        // A looping request runs once per element; any other request once.
+        let elements = match file
+            .loop_items(step.request, &responses)
+            .with_context(|| label.clone())?
+        {
+            Some(items) => items.into_iter().map(Some).collect(),
+            None => vec![None],
+        };
+        let looping = step.request.foreach.is_some();
+        let mut iterations = Vec::new();
+        for (i, element) in elements.iter().enumerate() {
+            let label = || {
+                if looping {
+                    format!("{label} (element {i})")
+                } else {
+                    label.clone()
+                }
+            };
+            let builder = match step.builder.take() {
+                Some(builder) => builder,
+                None => file
+                    .resolve(step.request, &responses, element.as_ref())
+                    .and_then(|request| build(&client, request, netrc.as_deref()))
+                    .with_context(label)?,
+            };
+            let received = builder
+                .send()
+                .map_err(anyhow::Error::from)
+                .and_then(Received::read)
+                .with_context(label)?;
+            // Responses of a looping request cannot be referenced.
+            if let Some(name) = step.request.name.as_ref().filter(|_| !looping) {
+                responses.insert(name.clone(), received.captured());
+            }
+
+            if args.json {
+                if step.selected || args.with_deps {
+                    let mut output = received.json(step.index, step.request.name.as_deref());
+                    if !step.selected {
+                        output["dependency"] = json!(true);
+                    }
+                    iterations.push(output);
+                }
+                continue;
+            }
+            // -b prints only the -n requests; the default output prints every response.
+            if args.body && !step.selected {
+                continue;
+            }
+            let mut output = Vec::new();
+            if !args.body {
+                // Start each later header block on its own line; bare bodies stay as sent.
+                if last_byte.is_some_and(|byte| byte != b'\n') {
+                    output.push(b'\n');
+                }
+                output.extend_from_slice(received.head().as_bytes());
+            }
+            output.extend_from_slice(&received.body);
+            stdout
+                .write_all(&output)
+                .and_then(|()| stdout.flush())
+                .context("failed to write body")?;
+            last_byte = output.last().copied().or(last_byte);
+        }
+        // A looping -n takes one JSON slot holding all of its iterations.
+        if args.json && (step.selected || args.with_deps) {
+            if looping {
+                json_output.push(Value::Array(iterations));
+            } else {
+                json_output.extend(iterations);
+            }
+        }
+    }
+
+    if !args.json {
+        return Ok(Output::Written);
+    }
+    Ok(Output::Json(if args.names.len() == 1 && !args.with_deps {
+        json_output.remove(0)
     } else {
-        Value::Array(responses)
+        Value::Array(json_output)
     }))
+}
+
+/// A request to send, in the order planned.
+struct Step<'a> {
+    /// 1-based position in the file.
+    index: usize,
+    request: &'a httpfile::Request,
+    /// How errors name the request: its `-n` selector, or its name when it
+    /// runs as a dependency.
+    label: String,
+    /// Given with `-n`, rather than run only as a dependency.
+    selected: bool,
+    /// Uses earlier responses, so it can only be built once those arrive.
+    chained: bool,
+    builder: Option<RequestBuilder>,
+}
+
+/// Orders the selected requests and the requests they reference: each
+/// dependency without a response yet runs first (depth-first), once; a
+/// request given with `-n` always runs.
+fn plan<'a>(file: &'a httpfile::HttpFile, selectors: &[String]) -> Result<Vec<Step<'a>>> {
+    let mut planner = Planner {
+        file,
+        steps: Vec::new(),
+        responded: HashSet::new(),
+        stack: Vec::new(),
+    };
+    for selector in selectors {
+        let (index, request) = select(&file.requests, selector)?;
+        planner
+            .visit(index, request, selector, true)
+            .with_context(|| format!("request \"{selector}\""))?;
+    }
+    Ok(planner.steps)
+}
+
+struct Planner<'a> {
+    file: &'a httpfile::HttpFile,
+    steps: Vec<Step<'a>>,
+    /// Indexes of the requests planned so far.
+    responded: HashSet<usize>,
+    /// Indexes of the requests being visited, to detect cycles.
+    stack: Vec<usize>,
+}
+
+impl<'a> Planner<'a> {
+    fn visit(
+        &mut self,
+        index: usize,
+        request: &'a httpfile::Request,
+        label: &str,
+        selected: bool,
+    ) -> Result<()> {
+        if !selected && self.responded.contains(&index) {
+            return Ok(());
+        }
+        if let Some(start) = self.stack.iter().position(|&i| i == index) {
+            let cycle: Vec<_> = self.stack[start..]
+                .iter()
+                .chain([&index])
+                .map(|&i| {
+                    self.file.requests[i - 1]
+                        .name
+                        .clone()
+                        .unwrap_or(format!("#{i}"))
+                })
+                .collect();
+            bail!("dependency cycle: {}", cycle.join(" -> "));
+        }
+
+        let references = self.file.references(request)?;
+        self.stack.push(index);
+        for reference in &references {
+            let name = &reference.name;
+            let (dep_index, dependency) = find_named(&self.file.requests, name)?
+                .with_context(|| format!("no request named \"{name}\""))?;
+            if dep_index == index {
+                bail!("request \"{name}\" depends on itself");
+            }
+            if dependency.foreach.is_some() {
+                bail!("request \"{name}\" loops (@foreach), so its responses cannot be referenced");
+            }
+            self.visit(dep_index, dependency, name, false)
+                .with_context(|| format!("request \"{name}\""))?;
+        }
+        self.stack.pop();
+
+        self.steps.push(Step {
+            index,
+            request,
+            label: label.to_string(),
+            selected,
+            chained: !references.is_empty(),
+            builder: None,
+        });
+        self.responded.insert(index);
+        Ok(())
+    }
+}
+
+/// The one request with this exact name, with its 1-based index.
+fn find_named<'a>(
+    requests: &'a [httpfile::Request],
+    name: &str,
+) -> Result<Option<(usize, &'a httpfile::Request)>> {
+    let mut matches = (1..)
+        .zip(requests)
+        .filter(|(_, r)| r.name.as_deref() == Some(name));
+    let found = matches.next();
+    if matches.next().is_some() {
+        bail!("more than one request is named \"{name}\"");
+    }
+    Ok(found)
 }
 
 /// Finds the one request with this exact name or, failing that, the request
@@ -195,13 +356,7 @@ fn select<'a>(
     requests: &'a [httpfile::Request],
     selector: &str,
 ) -> Result<(usize, &'a httpfile::Request)> {
-    let mut matches = (1..)
-        .zip(requests)
-        .filter(|(_, r)| r.name.as_deref() == Some(selector));
-    if let Some(found) = matches.next() {
-        if matches.next().is_some() {
-            bail!("more than one request is named \"{selector}\"");
-        }
+    if let Some(found) = find_named(requests, selector)? {
         return Ok(found);
     }
     let index = selector
@@ -281,55 +436,81 @@ fn read_netrc(path: Option<&Path>) -> Result<Option<String>> {
     }
 }
 
-fn render(index: usize, name: Option<&str>, response: Response) -> Result<Value> {
-    let status = response.status();
-    let url = response.url().to_string();
-    let version = format!("{:?}", response.version());
-    let headers = headers_json(response.headers());
-    let cookies: Vec<Value> = response.cookies().map(cookie_json).collect();
-    let body = response.bytes().context("failed to read response body")?;
-    let (base64, body) = body_text(&body);
-    let mut output = json!({
-        "index": index,
-        "name": name,
-        "url": url,
-        "version": version,
-        "status": { "code": status.as_u16(), "reason": status.canonical_reason() },
-        "headers": headers,
-        "cookies": cookies,
-        "body": body,
-    });
-    if base64 {
-        output["body_base64"] = json!(true);
-    }
-    Ok(output)
+/// A response read in full.
+struct Received {
+    url: String,
+    version: Version,
+    status: StatusCode,
+    headers: HeaderMap,
+    cookies: Vec<Value>,
+    body: Vec<u8>,
 }
 
-/// Writes the status line and headers like `curl -v`, each prefixed with `< `
-/// (unless `head` is false), then the body exactly as received.
-fn render_raw(output: &mut Vec<u8>, response: Response, head: bool) -> Result<()> {
-    if head {
-        output.extend_from_slice(raw_head(&response).as_bytes());
+impl Received {
+    fn read(response: Response) -> Result<Self> {
+        Ok(Received {
+            url: response.url().to_string(),
+            version: response.version(),
+            status: response.status(),
+            headers: response.headers().clone(),
+            cookies: response.cookies().map(cookie_json).collect(),
+            body: response
+                .bytes()
+                .context("failed to read response body")?
+                .to_vec(),
+        })
     }
-    output.extend_from_slice(&response.bytes().context("failed to read response body")?);
-    Ok(())
-}
 
-fn raw_head(response: &Response) -> String {
-    let status = response.status();
-    let mut head = format!("< {:?} {}", response.version(), status.as_u16());
-    if let Some(reason) = status.canonical_reason() {
-        head.push_str(&format!(" {reason}"));
+    /// What later requests can reference.
+    fn captured(&self) -> httpfile::Captured {
+        httpfile::Captured {
+            headers: self
+                .headers
+                .iter()
+                .map(|(name, value)| {
+                    let value = String::from_utf8_lossy(value.as_bytes()).into_owned();
+                    (name.to_string(), value)
+                })
+                .collect(),
+            body: self.body.clone(),
+        }
     }
-    head.push('\n');
-    for (name, value) in response.headers() {
-        head.push_str(&format!(
-            "< {name}: {}\n",
-            String::from_utf8_lossy(value.as_bytes())
-        ));
+
+    fn json(&self, index: usize, name: Option<&str>) -> Value {
+        let (base64, body) = body_text(&self.body);
+        let mut output = json!({
+            "index": index,
+            "name": name,
+            "url": self.url,
+            "version": format!("{:?}", self.version),
+            "status": { "code": self.status.as_u16(), "reason": self.status.canonical_reason() },
+            "headers": headers_json(&self.headers),
+            "cookies": self.cookies,
+            "body": body,
+        });
+        if base64 {
+            output["body_base64"] = json!(true);
+        }
+        output
     }
-    head.push_str("< \n");
-    head
+
+    /// The status line and headers like `curl -v`, each prefixed with `< `,
+    /// ending with a `< ` line.
+    fn head(&self) -> String {
+        let mut head = format!("< {:?} {}", self.version, self.status.as_u16());
+        if let Some(reason) = self.status.canonical_reason() {
+            head.push_str(&format!(" {reason}"));
+        }
+        head.push('\n');
+        for (name, value) in &self.headers {
+            head.push_str(&format!(
+                "< {name}: {}\n",
+                String::from_utf8_lossy(value.as_bytes())
+            ));
+        }
+        head.push_str("< \n");
+        head
+    }
 }
 
 /// Maps each header name to all of its values, in response order.
