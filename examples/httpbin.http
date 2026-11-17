@@ -4,6 +4,8 @@
 #   axon-cli -f examples/httpbin.http -l                     # list names only
 #   axon-cli -f examples/httpbin.http -n get                 # run one
 #   axon-cli -f examples/httpbin.http -n "set cookie" -n "read cookies"
+#   axon-cli -f examples/httpbin.http -n "csrf form"          # runs "login" first, uses its cookies
+#   axon-cli -f examples/httpbin.http -n "show upload"        # runs "upload" first, filters its values
 #   axon-cli -f examples/httpbin.http -n "basic auth" --netrc-file examples/netrc
 #   axon-cli -f examples/httpbin.http -n "show item"         # runs "create item" first
 #   axon-cli -f examples/httpbin.http -n "each slide"        # runs "slides" first, then once per slide
@@ -16,6 +18,9 @@
 # A file variable can read the environment; it is only needed (and checked)
 # when a request that uses it runs.
 @token = {{$env HTTPBIN_TOKEN}}
+# Filters work in file variables too; this one is only evaluated (and
+# "upload" only sent) when a request that uses {{item_id}} runs.
+@item_id = {{upload.response.headers.Location | split("/", -1) | split("?", 0)}}
 
 ### get
 GET {{base}}/get?source=axon-cli
@@ -84,6 +89,47 @@ GET {{base}}/cookies/set?flavor=oatmeal
 ### read cookies
 # Run after "set cookie" in the same invocation to see the cookie sent back.
 GET {{base}}/cookies
+
+### login
+# A login that sets two cookies: a CSRF token and an HttpOnly session.
+# (httpbin's /response-headers returns whatever headers the query asks for.)
+GET {{base}}/response-headers?Set-Cookie=csrftoken%3Dx7k2p9%3B%20Path%3D%2F&Set-Cookie=session%3Dabc123%3B%20HttpOnly
+
+### csrf form
+# Cookie chaining: {{login.response.cookies.NAME}} is the cookie's value only,
+# without attributes, so "login" runs first. Both cookies are also sent back
+# automatically in the Cookie header, since they are in the same run; the
+# CSRF token is copied into a header and the body as well.
+POST {{base}}/anything/form
+X-CSRF-Token: {{login.response.cookies.csrftoken}}
+Content-Type: application/json
+
+{"csrf": "{{login.response.cookies.csrftoken}}", "session": "{{login.response.cookies.session}}"}
+
+### session path
+# Cookie values work in the URL too. Only cookies on the final response can be
+# referenced: "set cookie" sets its cookie on a redirect, so
+# {{set cookie.response.cookies.flavor}} only works with --no-follow.
+GET {{base}}/anything/session/{{login.response.cookies.session}}
+
+### upload
+# Returns a Location header and echoes it, plus two values, as JSON:
+#   Location: /api/v2/items/42?rev=7
+#   {"Location": "/api/v2/items/42?rev=7", "X-File": "report-2026-11.json",
+#    "X-Token": " Bearer t0k3n ", ...}
+GET {{base}}/response-headers?Location=%2Fapi%2Fv2%2Fitems%2F42%3Frev%3D7&X-Token=%20Bearer%20t0k3n%20&X-File=report-2026-11.json
+
+### show upload
+# Filters take parts of a value with "|", applied left to right:
+#   split("sep", N)  part N after splitting on sep (0-based, -1 is the last)
+#   trim             strip leading and trailing whitespace
+#   prefix("x")      remove x from the start (an error if it is not there)
+#   suffix("x")      remove x from the end (an error if it is not there)
+# Here: item 42 (via @item_id), revision 7, token "t0k3n", month "2026-11".
+GET {{base}}/anything/items/{{item_id}}?rev={{upload.response.headers.Location | split("rev=", 1)}}
+Authorization: Bearer {{upload.response.body.$['X-Token'] | trim | prefix("Bearer ")}}
+X-Month: {{upload.response.body.$['X-File'] | suffix(".json") | prefix("report-")}}
+X-Year: {{upload.response.body.$['X-File'] | split("-", 1)}}
 
 ### redirect
 GET {{base}}/redirect/2
