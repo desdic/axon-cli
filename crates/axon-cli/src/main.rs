@@ -59,6 +59,10 @@ struct Args {
     /// an array of every response, in the order sent
     #[arg(long, requires = "json")]
     with_deps: bool,
+
+    /// Treat a failed `@warn` check like a failed `@assert`
+    #[arg(long)]
+    strict: bool,
 }
 
 enum Output {
@@ -69,14 +73,21 @@ enum Output {
 
 fn main() -> ExitCode {
     match run(Args::parse()) {
-        Ok(Output::Json(output)) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&output).expect("JSON value serializes")
-            );
-            ExitCode::SUCCESS
+        Ok((output, failed)) => {
+            if let Output::Json(output) = output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&output).expect("JSON value serializes")
+                );
+            }
+            match failed {
+                Some(summary) => {
+                    eprintln!("{}", json!({ "error": summary }));
+                    ExitCode::FAILURE
+                }
+                None => ExitCode::SUCCESS,
+            }
         }
-        Ok(Output::Written) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("{}", json!({ "error": format!("{err:#}") }));
             ExitCode::FAILURE
@@ -84,7 +95,9 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: Args) -> Result<Output> {
+/// Runs the requests, returning the output and, when checks failed, a
+/// summary such as `2 checks failed, 1 request skipped`.
+fn run(args: Args) -> Result<(Output, Option<String>)> {
     let path = &args.file;
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -93,30 +106,36 @@ fn run(args: Args) -> Result<Output> {
 
     if args.list {
         // An unnamed request is listed as the `#N` that selects it with -n.
-        return Ok(Output::Json(
-            file.requests
-                .iter()
-                .zip(1..)
-                .map(|(r, index)| r.name.clone().unwrap_or(format!("#{index}")))
-                .collect(),
+        return Ok((
+            Output::Json(
+                file.requests
+                    .iter()
+                    .zip(1..)
+                    .map(|(r, index)| r.name.clone().unwrap_or(format!("#{index}")))
+                    .collect(),
+            ),
+            None,
         ));
     }
     if args.names.is_empty() {
-        return Ok(Output::Json(
-            file.requests
-                .iter()
-                .zip(1..)
-                .map(|(r, index)| {
-                    json!({
-                        "index": index,
-                        "name": r.name,
-                        "method": r.method,
-                        "url": r.url,
-                        "start_line": r.start_line,
-                        "end_line": r.end_line,
+        return Ok((
+            Output::Json(
+                file.requests
+                    .iter()
+                    .zip(1..)
+                    .map(|(r, index)| {
+                        json!({
+                            "index": index,
+                            "name": r.name,
+                            "method": r.method,
+                            "url": r.url,
+                            "start_line": r.start_line,
+                            "end_line": r.end_line,
+                        })
                     })
-                })
-                .collect(),
+                    .collect(),
+            ),
+            None,
         ));
     }
 
@@ -151,8 +170,23 @@ fn run(args: Args) -> Result<Output> {
     let mut json_output = Vec::new();
     let mut stdout = std::io::stdout().lock();
     let mut last_byte = None;
+    // Requests whose latest run failed a check that counts, or was skipped.
+    let mut failed = HashSet::new();
+    let mut failed_checks = 0;
+    let mut skipped = 0;
     for mut step in steps {
         let label = format!("request \"{}\"", step.label);
+        if let Some(dependency) = step.depends_on.iter().find(|d| failed.contains(*d)) {
+            eprintln!("SKIP {label}: \"{dependency}\" failed its checks");
+            skipped += 1;
+            if let Some(name) = &step.request.name {
+                failed.insert(name.clone());
+            }
+            if args.json && (step.selected || args.with_deps) {
+                json_output.push(Value::Null);
+            }
+            continue;
+        }
         // A looping request runs once per element; any other request once.
         let elements = match file
             .loop_items(step.request, &responses)
@@ -163,6 +197,7 @@ fn run(args: Args) -> Result<Output> {
         };
         let looping = step.request.foreach.is_some();
         let mut iterations = Vec::new();
+        let mut step_failed = false;
         for (i, element) in elements.iter().enumerate() {
             let label = || {
                 if looping {
@@ -183,9 +218,11 @@ fn run(args: Args) -> Result<Output> {
                 .map_err(anyhow::Error::from)
                 .and_then(Received::read)
                 .with_context(label)?;
+            let captured = received.captured();
+            let checks = file.check(step.request, &captured, &responses, element.as_ref());
             // Responses of a looping request cannot be referenced.
             if let Some(name) = step.request.name.as_ref().filter(|_| !looping) {
-                responses.insert(name.clone(), received.captured());
+                responses.insert(name.clone(), captured);
             }
 
             if args.json {
@@ -194,28 +231,54 @@ fn run(args: Args) -> Result<Output> {
                     if !step.selected {
                         output["dependency"] = json!(true);
                     }
+                    if !step.request.checks.is_empty() {
+                        output["checks"] = checks_json(&checks);
+                    }
                     iterations.push(output);
                 }
-                continue;
-            }
             // -b prints only the -n requests; the default output prints every response.
-            if args.body && !step.selected {
-                continue;
-            }
-            let mut output = Vec::new();
-            if !args.body {
-                // Start each later header block on its own line; bare bodies stay as sent.
-                if last_byte.is_some_and(|byte| byte != b'\n') {
-                    output.push(b'\n');
+            } else if !args.body || step.selected {
+                let mut output = Vec::new();
+                if !args.body {
+                    // Start each later header block on its own line; bare bodies stay as sent.
+                    if last_byte.is_some_and(|byte| byte != b'\n') {
+                        output.push(b'\n');
+                    }
+                    output.extend_from_slice(received.head().as_bytes());
                 }
-                output.extend_from_slice(received.head().as_bytes());
+                output.extend_from_slice(&received.body);
+                stdout
+                    .write_all(&output)
+                    .and_then(|()| stdout.flush())
+                    .context("failed to write body")?;
+                last_byte = output.last().copied().or(last_byte);
             }
-            output.extend_from_slice(&received.body);
-            stdout
-                .write_all(&output)
-                .and_then(|()| stdout.flush())
-                .context("failed to write body")?;
-            last_byte = output.last().copied().or(last_byte);
+
+            // Failed checks are reported after the response they belong to.
+            for check in &checks {
+                let Some(error) = &check.error else {
+                    continue;
+                };
+                let tag = match check.level {
+                    httpfile::Level::Assert => "FAIL",
+                    httpfile::Level::Warn => "WARN",
+                    httpfile::Level::Notice => "NOTICE",
+                };
+                eprintln!("{tag} {}: {}: {error}", label(), check.text);
+                if check.level == httpfile::Level::Assert
+                    || (args.strict && check.level == httpfile::Level::Warn)
+                {
+                    failed_checks += 1;
+                    step_failed = true;
+                }
+            }
+        }
+        if let Some(name) = &step.request.name {
+            if step_failed {
+                failed.insert(name.clone());
+            } else {
+                failed.remove(name);
+            }
         }
         // A looping -n takes one JSON slot holding all of its iterations.
         if args.json && (step.selected || args.with_deps) {
@@ -227,14 +290,46 @@ fn run(args: Args) -> Result<Output> {
         }
     }
 
+    let summary = (failed_checks + skipped > 0).then(|| {
+        let mut summary = count(failed_checks, "check", "failed");
+        if skipped > 0 {
+            summary.push_str(&format!(", {}", count(skipped, "request", "skipped")));
+        }
+        summary
+    });
     if !args.json {
-        return Ok(Output::Written);
+        return Ok((Output::Written, summary));
     }
-    Ok(Output::Json(if args.names.len() == 1 && !args.with_deps {
+    let output = if args.names.len() == 1 && !args.with_deps {
         json_output.remove(0)
     } else {
         Value::Array(json_output)
-    }))
+    };
+    Ok((Output::Json(output), summary))
+}
+
+/// `1 check failed`, `2 checks failed`.
+fn count(n: usize, noun: &str, verb: &str) -> String {
+    let plural = if n == 1 { "" } else { "s" };
+    format!("{n} {noun}{plural} {verb}")
+}
+
+/// The results of a response's checks, passing ones included.
+fn checks_json(checks: &[httpfile::CheckResult]) -> Value {
+    checks
+        .iter()
+        .map(|check| {
+            let mut output = json!({
+                "level": check.level.keyword(),
+                "check": check.text,
+                "ok": check.error.is_none(),
+            });
+            if let Some(error) = &check.error {
+                output["error"] = json!(error);
+            }
+            output
+        })
+        .collect()
 }
 
 /// A request to send, in the order planned.
@@ -249,6 +344,9 @@ struct Step<'a> {
     selected: bool,
     /// Uses earlier responses, so it can only be built once those arrive.
     chained: bool,
+    /// Names of the requests whose responses it uses; it is skipped when one
+    /// of them failed its checks.
+    depends_on: Vec<String>,
     builder: Option<RequestBuilder>,
 }
 
@@ -328,6 +426,7 @@ impl<'a> Planner<'a> {
             label: label.to_string(),
             selected,
             chained: !references.is_empty(),
+            depends_on: references.iter().map(|r| r.name.clone()).collect(),
             builder: None,
         });
         self.responded.insert(index);
@@ -464,6 +563,7 @@ impl Received {
     /// What later requests can reference.
     fn captured(&self) -> httpfile::Captured {
         httpfile::Captured {
+            status: self.status.as_u16(),
             headers: self
                 .headers
                 .iter()

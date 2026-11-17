@@ -28,6 +28,7 @@ axon-cli -f <FILE> -n <NAME> --json       # print the full responses as JSON
 | `-j, --json` | Print each `-n` response as JSON (status, headers, cookies, body) instead of the headers and raw body |
 | `--with-deps` | With `--json`, also print the responses of requests run only as dependencies (marked `"dependency": true`); the output is then always an array of every response, in the order sent. Requires `--json` |
 | `-b, --body` | Print only the raw body of each `-n` response, without the status line and headers |
+| `--strict` | Treat a failed `@warn` check like a failed `@assert` (see [Checks](#checks)) |
 
 Credentials come from `.netrc` unless the request has an `Authorization` header or `user:pass@` in the URL. Cookies set by one request are sent on later requests in the same run.
 
@@ -159,6 +160,55 @@ Authorization: Bearer {{login.response.body.$.auth | trim | prefix("Bearer ")}}
 - Unknown filters and wrong arguments are reported before any request is sent. A split index out of range or a missing prefix/suffix is an error when the request is about to be sent, naming the value: `{{... | split("/", 9)}}: split("/", 9): "/api/v2/items/42?rev=7" gives 5 parts`.
 - `@foreach` cannot use filters, since it needs an array.
 
+### Checks
+
+`# @assert`, `# @warn` and `# @notice` lines before the request line check each response of that request:
+
+```http
+### get cluster
+# @assert status == 200
+# @assert {{response.body.$.data[0].links.self}} exists
+# @warn {{response.headers.Content-Type}} contains "json"
+# @notice {{response.body.$.data[0].deprecated}} !exists
+GET {{sysapi}}/find/clusters/by-name/{{cluster}}
+```
+
+A check is `SUBJECT OPERATOR [EXPECTED]`:
+
+- SUBJECT is `status` or one `{{...}}` value. Inside a check, `{{response.body.$.path}}`, `{{response.headers.Name}}`, `{{response.cookies.name}}` and `{{response.status}}` read the request's own response (for a looping request, the current iteration's). Variables, other requests' responses, loop variables and filters work as everywhere else.
+- OPERATOR is `==`, `!=`, `contains`, `!contains`, `<`, `<=`, `>`, `>=`, `exists` or `!exists`.
+- EXPECTED is the rest of the line: a double-quoted string (`\"` and `\\` escapes) or bare text such as `200`, `true` or `{{wc.id}}`. `exists` and `!exists` take none.
+
+Values are compared as text, as they would be inserted in a request (strings unquoted, other JSON values as compact JSON); `<`, `<=`, `>` and `>=` compare numbers. `exists` passes when the value can be read and its filters succeed, and a subject that cannot be read fails every operator except `!exists`.
+
+| Check | Passes when |
+|---|---|
+| `# @assert status < 400` | the status code is below 400 |
+| `# @assert {{response.body.$.error}} !exists` | the body has no `error` field |
+| `# @assert {{response.body.$.data.id}} == "{{wc.id}}"` | the id matches the current loop element |
+| `# @assert {{response.body.$.count}} >= 1` | `count` is a number of at least 1 |
+| `# @warn {{response.headers.Location \| split("/", -1)}} == "42"` | the last part of `Location` is `42` |
+| `# @notice {{response.cookies.session}} exists` | a `session` cookie is set |
+
+Every check is evaluated, and each failure is printed on stderr after its response:
+
+```
+FAIL request "get cluster": status == 200: got "404"
+SKIP request "webconfig": "get cluster" failed its checks
+WARN request "webconfig": {{response.headers.Content-Type}} contains "json": got "text/plain"
+NOTICE request "webconfigs" (element 2): {{response.body.$.data.deprecated}} !exists: got "true"
+```
+
+| Level | On failure |
+|---|---|
+| `@assert` | `FAIL`; exit code 1. Requests that use its response are not sent (`SKIP`), nor the requests that use theirs; other requests and loop iterations still run |
+| `@warn` | `WARN`; exit code unchanged, unless `--strict` makes it act as `@assert` |
+| `@notice` | `NOTICE`; never changes the exit code |
+
+- When checks fail, the run ends with `{"error": "2 checks failed, 1 request skipped"}` on stderr and exit code 1. The responses are still printed, `--json` included.
+- With `--json`, each response of a request with checks has `"checks": [{"level": "assert", "check": "status == 200", "ok": false, "error": "got \"404\""}, ...]`, passing checks included; a skipped `-n` request is `null`.
+- Invalid check lines, filters, undefined variables and unknown requests in checks are reported before any request is sent. A request used in a check is a dependency like any other.
+
 ### Examples
 
 ```sh
@@ -233,7 +283,7 @@ Several `-n` print their responses in the order given; a newline is added betwee
 }
 ```
 
-`body` is the raw response body as a string, exactly as the server sent it (JSON bodies are not parsed or reformatted); a non-UTF-8 (binary) body is base64-encoded instead and marked with `"body_base64": true`, a field that is absent otherwise; several `-n` print a JSON array in the order given. With `--with-deps` the output is always an array of every response sent, dependencies included and marked `"dependency": true` (the field is absent otherwise), in the order sent. The exit code is `0` when every request sent received a response (including 4xx/5xx) and `1` on errors (unknown or duplicate names, parse errors, undefined variables, invalid or cyclic response references, missing chained values, network errors), which are printed to stderr as `{"error": "..."}`. Names, variables and response references are checked before any request is sent; responses already printed stay printed when a later request fails (with `--json`, nothing is printed).
+`body` is the raw response body as a string, exactly as the server sent it (JSON bodies are not parsed or reformatted); a non-UTF-8 (binary) body is base64-encoded instead and marked with `"body_base64": true`, a field that is absent otherwise; several `-n` print a JSON array in the order given. With `--with-deps` the output is always an array of every response sent, dependencies included and marked `"dependency": true` (the field is absent otherwise), in the order sent. The exit code is `0` when every request sent received a response (including 4xx/5xx) and no check failed (see [Checks](#checks)), and `1` on failed checks or on errors (unknown or duplicate names, parse errors, undefined variables, invalid or cyclic response references, missing chained values, network errors), which are printed to stderr as `{"error": "..."}`. Names, variables and response references are checked before any request is sent; responses already printed stay printed when a later request fails (with `--json`, nothing is printed).
 
 ### Building
 
