@@ -755,6 +755,70 @@ fn chained_values_are_substituted() {
 }
 
 #[test]
+fn chained_cookies_are_substituted() {
+    let base = start_server();
+    let r = run_file(
+        "chain-cookies",
+        &format!(
+            "### login\nGET {base}/json\n\n### me\nGET {base}/json\nX-Test: {{{{login.response.cookies.session}}}}\nX-Test: {{{{ login.response.cookies.theme }}}}\n"
+        ),
+        &["-n", "me"],
+    );
+
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.echo("x_test"), json!(["abc123", "dark"]));
+}
+
+#[test]
+fn chained_values_can_be_filtered() {
+    let base = start_server();
+    let r = run_file(
+        "chain-filters",
+        &format!(
+            "### login\nGET {base}/json\n\n### me\nGET {base}/json\nX-Test: {{{{login.response.headers.Content-Type | split(\"/\", -1)}}}}\nX-Test: {{{{login.response.cookies.session | suffix(\"123\") | prefix(\"a\")}}}}\n"
+        ),
+        &["-n", "me"],
+    );
+
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.echo("x_test"), json!(["json", "bc"]));
+}
+
+#[test]
+fn invalid_filter_is_reported_before_sending() {
+    let r = run_file(
+        "chain-bad-filter",
+        &format!(
+            "### login\nGET {}\n\n### me\nGET http://x/{{{{login.response.headers.X | splitt(\"/\", 0)}}}}\n",
+            refused_url()
+        ),
+        &["-n", "me"],
+    );
+
+    assert_error(
+        &r,
+        "request \"me\": invalid filter in {{login.response.headers.X | splitt(\"/\", 0)}}: unknown filter \"splitt\" (expected split, trim, prefix or suffix)",
+    );
+}
+
+#[test]
+fn failing_filter_stops_the_run() {
+    let base = start_server();
+    let r = run_file(
+        "chain-filter-fails",
+        &format!(
+            "### login\nGET {base}/json\n\n### me\nGET {base}/json\nX-Test: {{{{login.response.cookies.theme | split(\"/\", 1)}}}}\n"
+        ),
+        &["-n", "me"],
+    );
+
+    assert_error(
+        &r,
+        "request \"me\": {{login.response.cookies.theme | split(\"/\", 1)}}: split(\"/\", 1): \"dark\" gives 1 part",
+    );
+}
+
+#[test]
 fn json_includes_only_selected_requests() {
     let base = start_server();
     let one = run_file("chain-json-one", &chain(&base), &["-n", "me"]);
