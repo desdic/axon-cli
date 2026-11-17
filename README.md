@@ -205,6 +205,21 @@ NOTICE request "webconfigs" (element 2): {{response.body.$.data.deprecated}} !ex
 | `@warn` | `WARN`; exit code unchanged, unless `--strict` makes it act as `@assert` |
 | `@notice` | `NOTICE`; never changes the exit code |
 
+`@fail-if`, `@warn-if` and `@notice-if` take the same checks but report when the check is **true**, failing like `@assert`, `@warn` (including `--strict`) and `@notice`:
+
+```http
+# @fail-if status >= 500
+# @warn-if {{wc.attributes.mail_send_username}} == null
+# @warn-if {{wc.attributes.runtime.resource_limits.cpushares}} > 2
+# @notice-if {{response.body.$.data.deprecated}} == true
+```
+
+```
+WARN request "webconfigs" (element 3): if {{wc.attributes.mail_send_username}} == null: matched "null"
+```
+
+Only the comparison is inverted: a value that cannot be read, or that is not a number for `<`, `<=`, `>`, `>=`, is still reported, since the condition cannot be checked (`@warn-if {{x}} == null` also warns when `x` is missing). For `exists` and `!exists` a missing value simply does not exist, so `@fail-if {{response.body.$.error}} exists` passes when there is no `error`. With `--json`, their results have `"if": true`.
+
 - When checks fail, the run ends with `{"error": "2 checks failed, 1 request skipped"}` on stderr and exit code 1. The responses are still printed, `--json` included.
 - With `--json`, each response of a request with checks has `"checks": [{"level": "assert", "check": "status == 200", "ok": false, "error": "got \"404\""}, ...]`, passing checks included; a skipped `-n` request is `null`.
 - Invalid check lines, filters, undefined variables and unknown requests in checks are reported before any request is sent. A request used in a check is a dependency like any other.

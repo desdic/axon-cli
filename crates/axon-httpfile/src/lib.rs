@@ -69,6 +69,15 @@ impl Level {
             Level::Notice => "notice",
         }
     }
+
+    /// The keyword of the directive that reports when its check is true.
+    pub fn if_keyword(self) -> &'static str {
+        match self {
+            Level::Assert => "fail-if",
+            Level::Warn => "warn-if",
+            Level::Notice => "notice-if",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -85,10 +94,14 @@ enum Op {
     NotExists,
 }
 
-/// A `# @assert SUBJECT OPERATOR [EXPECTED]` line (or `@warn`, `@notice`).
+/// A `# @assert SUBJECT OPERATOR [EXPECTED]` line (or `@warn`, `@notice`,
+/// and `@fail-if`, `@warn-if`, `@notice-if`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Check {
     pub level: Level,
+    /// Written as `@fail-if`, `@warn-if` or `@notice-if`: reported when the
+    /// comparison is true rather than false.
+    pub inverted: bool,
     /// The check as written after the keyword, for messages.
     pub text: String,
     /// One `{{...}}`, as written; `status` is `{{response.status}}`.
@@ -103,6 +116,8 @@ pub struct Check {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CheckResult {
     pub level: Level,
+    /// From a `-if` directive.
+    pub inverted: bool,
     /// The check as written after the keyword.
     pub text: String,
     /// Why the check failed; `None` when it passed.
@@ -539,10 +554,10 @@ fn parse_quoted(after: &str) -> Result<(String, &str)> {
     }
 }
 
-/// Parses the text after `@assert`, `@warn` or `@notice`:
+/// Parses the text after `@assert`, `@warn`, `@notice` or their `-if` forms:
 /// `SUBJECT OPERATOR [EXPECTED]`.
-fn parse_check(level: Level, text: &str) -> Result<Check> {
-    let keyword = level.keyword();
+fn parse_check(level: Level, inverted: bool, text: &str) -> Result<Check> {
+    let keyword = directive_keyword(level, inverted);
     let invalid = |why: String| anyhow::anyhow!("invalid @{keyword} ({why}): @{keyword} {text}");
     let (subject, rest) = if let Some(after) = text.strip_prefix("{{") {
         let end = after
@@ -602,6 +617,7 @@ fn parse_check(level: Level, text: &str) -> Result<Check> {
     };
     Ok(Check {
         level,
+        inverted,
         text: text.to_string(),
         subject,
         op,
@@ -609,26 +625,54 @@ fn parse_check(level: Level, text: &str) -> Result<Check> {
     })
 }
 
+/// `assert`, or `fail-if` for an inverted check.
+fn directive_keyword(level: Level, inverted: bool) -> &'static str {
+    if inverted {
+        level.if_keyword()
+    } else {
+        level.keyword()
+    }
+}
+
 impl Check {
+    /// The directive as written, with `@`.
+    pub fn directive(&self) -> String {
+        format!("@{}", directive_keyword(self.level, self.inverted))
+    }
+
     /// Compares the subject with the expected value; `eval` substitutes a
-    /// `{{...}}` text. The error says why the check failed.
+    /// `{{...}}` text. The error says why the check failed: the comparison
+    /// came out false (true for an inverted check), or a value could not be
+    /// read, which fails either way except for `exists` and `!exists`.
     fn evaluate(&self, eval: &mut dyn FnMut(&str) -> Result<String>) -> Result<()> {
         let subject = eval(&self.subject);
-        let got = |value: &str| anyhow::anyhow!("got {value:?}");
-        let actual = match (self.op, subject) {
-            (Op::Exists, subject) => return subject.map(drop),
-            (Op::NotExists, Ok(value)) => return Err(got(&value)),
-            (Op::NotExists, Err(_)) => return Ok(()),
-            (_, subject) => subject?,
+        let (holds, actual) = match self.op {
+            Op::Exists => (subject.is_ok(), subject),
+            Op::NotExists => (subject.is_err(), subject),
+            _ => {
+                let actual = subject?;
+                (self.compare(&actual, eval)?, Ok(actual))
+            }
         };
+        if holds != self.inverted {
+            return Ok(());
+        }
+        let word = if self.inverted { "matched" } else { "got" };
+        // A missing value is its own explanation.
+        let value = actual?;
+        Err(anyhow::anyhow!("{word} {value:?}"))
+    }
+
+    /// Whether the comparison of `actual` with the expected value is true.
+    fn compare(&self, actual: &str, eval: &mut dyn FnMut(&str) -> Result<String>) -> Result<bool> {
         let expected = eval(self.expected.as_deref().unwrap_or_default())?;
-        let pass = match self.op {
+        Ok(match self.op {
             Op::Eq => actual == expected,
             Op::Ne => actual != expected,
             Op::Contains => actual.contains(&expected),
             Op::NotContains => !actual.contains(&expected),
             op => {
-                let (a, e) = (number(&actual)?, number(&expected)?);
+                let (a, e) = (number(actual)?, number(&expected)?);
                 match op {
                     Op::Lt => a < e,
                     Op::Le => a <= e,
@@ -636,8 +680,7 @@ impl Check {
                     _ => a >= e,
                 }
             }
-        };
-        if pass { Ok(()) } else { Err(got(&actual)) }
+        })
     }
 }
 
@@ -784,10 +827,10 @@ impl HttpFile {
             let line = line.trim();
             if line.is_empty() {
                 in_body = true;
-            } else if let Some((level, _)) = check_directive(line) {
+            } else if let Some((keyword, _)) = check_directive(line) {
                 bail!(
                     "line {line_no}: @{} must come before the request line",
-                    level.keyword()
+                    keyword
                 );
             } else if !is_comment(line) {
                 let Some((header, value)) = line.split_once(':') else {
@@ -878,7 +921,7 @@ impl HttpFile {
                 .flatten()
             {
                 self.substitute(text, self.variables.len(), scope, &mut collect)
-                    .with_context(|| format!("@{} {}", check.level.keyword(), check.text))?;
+                    .with_context(|| format!("{} {}", check.directive(), check.text))?;
             }
         }
         Ok(found)
@@ -921,6 +964,7 @@ impl HttpFile {
                 };
                 CheckResult {
                     level: check.level,
+                    inverted: check.inverted,
                     text: check.text.clone(),
                     error: check.evaluate(&mut eval).err().map(|e| format!("{e:#}")),
                 }
@@ -1150,18 +1194,23 @@ fn foreach_directive(line: &str) -> Option<Result<Foreach>> {
     Some(parse_foreach(rest.trim()))
 }
 
-/// The level and parsed check of a `# @assert ...`, `# @warn ...` or
-/// `# @notice ...` line (or `//`), or `None` when the line is not a check.
-fn check_directive(line: &str) -> Option<(Level, Result<Check>)> {
+/// The directive keyword and parsed check of a `# @assert ...`,
+/// `# @warn ...`, `# @notice ...` line or one of their `-if` forms (or with
+/// `//`), or `None` when the line is not a check.
+fn check_directive(line: &str) -> Option<(&'static str, Result<Check>)> {
     let rest = line.strip_prefix('#').or_else(|| line.strip_prefix("//"))?;
     let rest = rest.trim_start().strip_prefix('@')?;
-    Level::ALL.into_iter().find_map(|level| {
-        let text = rest.strip_prefix(level.keyword())?;
-        if !text.is_empty() && !text.starts_with(char::is_whitespace) {
-            return None;
-        }
-        Some((level, parse_check(level, text.trim())))
-    })
+    Level::ALL
+        .into_iter()
+        .flat_map(|level| [(level, false), (level, true)])
+        .find_map(|(level, inverted)| {
+            let keyword = directive_keyword(level, inverted);
+            let text = rest.strip_prefix(keyword)?;
+            if !text.is_empty() && !text.starts_with(char::is_whitespace) {
+                return None;
+            }
+            Some((keyword, parse_check(level, inverted, text.trim())))
+        })
 }
 
 /// The name from a `# @name NAME` or `// @name NAME` line.
@@ -1889,7 +1938,11 @@ mod tests {
             .into_iter()
             .map(|r| match r.error {
                 None => format!("ok {}", r.text),
-                Some(error) => format!("{} {}: {error}", r.level.keyword(), r.text),
+                Some(error) => format!(
+                    "{} {}: {error}",
+                    directive_keyword(r.level, r.inverted),
+                    r.text
+                ),
             })
             .collect()
     }
@@ -2091,6 +2144,89 @@ mod tests {
         assert_eq!(
             format!("{err:#}"),
             "@assert {{s}} == 200: undefined variable: response.status"
+        );
+    }
+
+    #[test]
+    fn parses_if_checks() {
+        let file = parse(concat!(
+            "# @fail-if status >= 500\n",
+            "// @warn-if {{response.body.$.x}} == null\n",
+            "# @notice-if {{response.body.$.x}} exists\n",
+            "# @assert status == 200\n",
+            "GET http://a/\n",
+        ))
+        .unwrap();
+        let checks: Vec<_> = file.requests[0]
+            .checks
+            .iter()
+            .map(|c| (c.level, c.inverted, c.directive()))
+            .collect();
+        assert_eq!(
+            checks,
+            [
+                (Level::Assert, true, "@fail-if".to_string()),
+                (Level::Warn, true, "@warn-if".to_string()),
+                (Level::Notice, true, "@notice-if".to_string()),
+                (Level::Assert, false, "@assert".to_string()),
+            ]
+        );
+        let err = parse("# @warn-if status\nGET http://a/\n").err().unwrap();
+        assert_eq!(
+            format!("{err:#}"),
+            "line 1: invalid @warn-if (missing operator): @warn-if status"
+        );
+        let err = parse("GET http://a/\n# @fail-if status == 1\n")
+            .err()
+            .unwrap();
+        assert_eq!(
+            err.to_string(),
+            "line 2: @fail-if must come before the request line"
+        );
+        // `@warn-iffy` is not a check, just a comment.
+        let file = parse("# @warn-iffy x\nGET http://a/\n").unwrap();
+        assert!(file.requests[0].checks.is_empty());
+    }
+
+    #[test]
+    fn if_checks_report_when_true() {
+        let mut own = captured(r#"{"name": "web", "n": null, "count": 3}"#);
+        own.status = 503;
+        let results = run_checks(
+            concat!(
+                "# @fail-if status >= 500\n",
+                "# @fail-if status < 500\n",
+                "# @warn-if {{response.body.$.n}} == null\n",
+                "# @warn-if {{response.body.$.name}} == null\n",
+                "# @warn-if {{response.body.$.missing}} == null\n",
+                "# @warn-if {{response.body.$.name}} > 2\n",
+                "# @notice-if {{response.body.$.count}} > 2\n",
+                "# @notice-if {{response.body.$.name}} contains \"we\"\n",
+                "# @fail-if {{response.body.$.name}} exists\n",
+                "# @fail-if {{response.body.$.missing}} exists\n",
+                "# @fail-if {{response.body.$.missing}} !exists\n",
+                "# @fail-if {{response.body.$.name}} !exists\n",
+                "GET http://a/\n",
+            ),
+            &own,
+            None,
+        );
+        assert_eq!(
+            results,
+            [
+                "fail-if status >= 500: matched \"503\"",
+                "ok status < 500",
+                "warn-if {{response.body.$.n}} == null: matched \"null\"",
+                "ok {{response.body.$.name}} == null",
+                "warn-if {{response.body.$.missing}} == null: response body has no value at $.missing",
+                "warn-if {{response.body.$.name}} > 2: not a number: \"web\"",
+                "notice-if {{response.body.$.count}} > 2: matched \"3\"",
+                "notice-if {{response.body.$.name}} contains \"we\": matched \"web\"",
+                "fail-if {{response.body.$.name}} exists: matched \"web\"",
+                "ok {{response.body.$.missing}} exists",
+                "fail-if {{response.body.$.missing}} !exists: response body has no value at $.missing",
+                "ok {{response.body.$.name}} !exists",
+            ]
         );
     }
 }
