@@ -264,7 +264,9 @@ fn run(args: Args) -> Result<(Output, Option<String>)> {
                     httpfile::Level::Warn => "WARN",
                     httpfile::Level::Notice => "NOTICE",
                 };
-                eprintln!("{tag} {}: {}: {error}", label(), check.text);
+                // A `-if` check reads `if CHECK: matched ...`.
+                let condition = if check.inverted { "if " } else { "" };
+                eprintln!("{tag} {}: {condition}{}: {error}", label(), check.text);
                 if check.level == httpfile::Level::Assert
                     || (args.strict && check.level == httpfile::Level::Warn)
                 {
@@ -324,6 +326,9 @@ fn checks_json(checks: &[httpfile::CheckResult]) -> Value {
                 "check": check.text,
                 "ok": check.error.is_none(),
             });
+            if check.inverted {
+                output["if"] = json!(true);
+            }
             if let Some(error) = &check.error {
                 output["error"] = json!(error);
             }
