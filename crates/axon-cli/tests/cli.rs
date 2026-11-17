@@ -1503,3 +1503,39 @@ fn invalid_checks_fail_before_sending() {
         assert!(message.starts_with(error), "{message}");
     }
 }
+
+#[test]
+fn if_checks_report_when_true() {
+    let base = start_server();
+    let file = format!(
+        "\
+### list
+# @fail-if status >= 500
+# @warn-if {{{{response.body.$.one}}}} == \"x\"
+# @notice-if {{{{response.body.$.users[0].name}}}} == \"carl\"
+GET {base}/list
+"
+    );
+    let (code, _, stderr) = run_raw("checks-if", &file, &["-n", "list"]);
+    assert_eq!(code, 0, "{stderr:?}");
+    assert_eq!(
+        stderr,
+        ["WARN request \"list\": if {{response.body.$.one}} == \"x\": matched \"x\""]
+    );
+
+    // --strict counts a failed @warn-if like a failed @warn.
+    let (code, _, stderr) = run_raw("checks-if-strict", &file, &["-n", "list", "--strict"]);
+    assert_eq!(code, 1);
+    assert_eq!(stderr[1], r#"{"error":"1 check failed"}"#);
+
+    let (_, stdout, _) = run_raw("checks-if-json", &file, &["-n", "list", "--json"]);
+    let output: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        output["checks"],
+        json!([
+            {"level": "assert", "check": "status >= 500", "ok": true, "if": true},
+            {"level": "warn", "check": "{{response.body.$.one}} == \"x\"", "ok": false, "if": true, "error": "matched \"x\""},
+            {"level": "notice", "check": "{{response.body.$.users[0].name}} == \"carl\"", "ok": true, "if": true},
+        ])
+    );
+}
