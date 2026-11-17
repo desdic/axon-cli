@@ -1,8 +1,9 @@
 //! Parser for `.http` files (JetBrains / VS Code REST Client format):
 //! `###` separators, `# @name`, `@var = value` file variables, and
 //! `{{var}}` / `{{$env NAME}}` substitution, and response chaining with
-//! `{{NAME.response.body.$.path}}` / `{{NAME.response.headers.Header}}`,
-//! and loops with `# @foreach VAR in {{NAME.response.body.$.path}}`.
+//! `{{NAME.response.body.$.path}}` / `{{NAME.response.headers.Header}}` /
+//! `{{NAME.response.cookies.Cookie}}`, filters such as
+//! `{{value | split("/", -1) | trim}}`, and loops with `# @foreach VAR in {{NAME.response.body.$.path}}`.
 
 use std::collections::HashMap;
 
@@ -32,8 +33,9 @@ pub struct Request {
     pub end_line: usize,
 }
 
-/// A `{{NAME.response.body.$.path}}` or `{{NAME.response.headers.Header}}`
-/// reference to the response of the request named NAME.
+/// A `{{NAME.response.body.$.path}}`, `{{NAME.response.headers.Header}}` or
+/// `{{NAME.response.cookies.Cookie}}` reference to the response of the request
+/// named NAME.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Reference {
     /// Name of the referenced request.
@@ -49,12 +51,36 @@ enum Part {
         steps: Vec<Step>,
     },
     Header(String),
+    /// A cookie set by a `Set-Cookie` header, by name.
+    Cookie(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
 enum Step {
     Key(String),
     Index(usize),
+}
+
+/// A filter applied to a `{{...}}` value with `|`, as in
+/// `{{value | split("/", -1) | trim}}`.
+#[derive(Clone, Debug, PartialEq)]
+enum Filter {
+    /// Part `index` (0-based; negative counts from the end) after splitting
+    /// on `separator`.
+    Split { separator: String, index: i64 },
+    /// Leading and trailing whitespace removed.
+    Trim,
+    /// The text after this prefix, which must be present.
+    Prefix(String),
+    /// The text before this suffix, which must be present.
+    Suffix(String),
+}
+
+/// A filter argument: a double-quoted string or an integer.
+#[derive(Debug, PartialEq)]
+enum Arg {
+    Text(String),
+    Int(i64),
 }
 
 /// A `# @foreach VAR in {{NAME.response.body.$.path}}` directive.
@@ -93,9 +119,11 @@ impl Reference {
             })
         } else if let Some(header) = rest.strip_prefix("headers.").filter(|h| !h.is_empty()) {
             Ok(Part::Header(header.to_string()))
+        } else if let Some(cookie) = rest.strip_prefix("cookies.").filter(|c| !c.is_empty()) {
+            Ok(Part::Cookie(cookie.to_string()))
         } else {
             Err(anyhow::anyhow!(
-                "expected \"body.$...\" or \"headers.NAME\" after \".response.\""
+                "expected \"body.$...\", \"headers.NAME\" or \"cookies.NAME\" after \".response.\""
             ))
         };
         Some(
@@ -108,13 +136,14 @@ impl Reference {
     }
 
     /// The referenced value as text: a JSON string without quotes, any other
-    /// JSON value as compact JSON, or the first value of the header (matched
-    /// case-insensitively).
+    /// JSON value as compact JSON, the first value of the header (matched
+    /// case-insensitively), or the value of the cookie (matched exactly; the
+    /// last one wins when it is set more than once).
     pub fn extract(&self, response: &Captured) -> Result<String> {
         self.value(response).map(|value| json_text(&value))
     }
 
-    /// The referenced value; a header value is a JSON string.
+    /// The referenced value; a header or cookie value is a JSON string.
     fn value(&self, response: &Captured) -> Result<Value> {
         let name = &self.name;
         match &self.part {
@@ -124,6 +153,15 @@ impl Reference {
                 .find(|(n, _)| n.eq_ignore_ascii_case(header))
                 .map(|(_, value)| Value::String(value.clone()))
                 .with_context(|| format!("response of \"{name}\" has no header {header}")),
+            Part::Cookie(cookie) => response
+                .headers
+                .iter()
+                .rev()
+                .filter(|(n, _)| n.eq_ignore_ascii_case("set-cookie"))
+                .filter_map(|(_, value)| set_cookie_pair(value))
+                .find(|(n, _)| n == cookie)
+                .map(|(_, value)| Value::String(value.to_string()))
+                .with_context(|| format!("response of \"{name}\" sets no cookie {cookie}")),
             Part::Body { path, steps } => {
                 let json: Value = serde_json::from_slice(&response.body)
                     .with_context(|| format!("response body of \"{name}\" is not JSON"))?;
@@ -139,8 +177,22 @@ impl Reference {
         match &self.part {
             Part::Body { path, .. } => format!("{}.response.body.{path}", self.name),
             Part::Header(header) => format!("{}.response.headers.{header}", self.name),
+            Part::Cookie(cookie) => format!("{}.response.cookies.{cookie}", self.name),
         }
     }
+}
+
+/// The name and value of a `Set-Cookie` header value (`name=value; attrs`),
+/// trimmed, with one pair of surrounding double quotes removed from the value.
+fn set_cookie_pair(header: &str) -> Option<(&str, &str)> {
+    let pair = header.split(';').next()?;
+    let (name, value) = pair.split_once('=')?;
+    let value = value.trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(value);
+    Some((name.trim(), value))
 }
 
 /// The value at `steps` inside `value`, if there is one.
@@ -184,15 +236,23 @@ fn parse_foreach(text: &str) -> Result<Foreach> {
     {
         bail!("invalid @foreach variable (use letters, digits, _ and -): {var}");
     }
+    if split_pipes(source).len() > 1 {
+        bail!("@foreach cannot use filters: {{{{{source}}}}}");
+    }
     let Some(source) = Reference::parse(source) else {
         bail!(
             "@foreach must loop over a {{{{NAME.response.body.$.path}}}} reference: {{{{{source}}}}}"
         );
     };
     let source = source?;
-    if matches!(source.part, Part::Header(_)) {
+    let kind = match source.part {
+        Part::Body { .. } => None,
+        Part::Header(_) => Some("header"),
+        Part::Cookie(_) => Some("cookie"),
+    };
+    if let Some(kind) = kind {
         bail!(
-            "@foreach must loop over a response body, not a header: {{{{{}}}}}",
+            "@foreach must loop over a response body, not a {kind}: {{{{{}}}}}",
             source.text()
         );
     }
@@ -200,6 +260,152 @@ fn parse_foreach(text: &str) -> Result<Foreach> {
         var: var.to_string(),
         source,
     })
+}
+
+/// Splits the text of a `{{...}}` on `|` outside double- and single-quoted
+/// strings, trimming each part: the value first, then its filters.
+fn split_pipes(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut start = 0;
+    for (i, c) in text.char_indices() {
+        match quote {
+            Some(_) if escaped => escaped = false,
+            Some('"') if c == '\\' => escaped = true,
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '|' => {
+                parts.push(text[start..i].trim());
+                start = i + 1;
+            }
+            None => {}
+        }
+    }
+    parts.push(text[start..].trim());
+    parts
+}
+
+impl Filter {
+    /// Parses one filter, as written between `|`s.
+    fn parse(text: &str) -> Result<Self> {
+        let (name, args) = match text.split_once('(') {
+            Some((name, rest)) => {
+                let args = rest
+                    .trim_end()
+                    .strip_suffix(')')
+                    .with_context(|| format!("missing \")\" in filter {text}"))?;
+                let args =
+                    parse_args(args).with_context(|| format!("invalid arguments in {text}"))?;
+                (name.trim(), args)
+            }
+            None => (text, Vec::new()),
+        };
+        let mut args = args.into_iter();
+        let filter = match (name, args.next(), args.next(), args.next()) {
+            ("split", Some(Arg::Text(separator)), Some(Arg::Int(index)), None)
+                if !separator.is_empty() =>
+            {
+                Filter::Split { separator, index }
+            }
+            ("split", ..) => bail!("split takes a separator and an index: split(\"/\", -1)"),
+            ("trim", None, ..) => Filter::Trim,
+            ("trim", ..) => bail!("trim takes no arguments"),
+            ("prefix", Some(Arg::Text(prefix)), None, _) => Filter::Prefix(prefix),
+            ("prefix", ..) => bail!("prefix takes one string: prefix(\"Bearer \")"),
+            ("suffix", Some(Arg::Text(suffix)), None, _) => Filter::Suffix(suffix),
+            ("suffix", ..) => bail!("suffix takes one string: suffix(\".json\")"),
+            _ => bail!("unknown filter \"{name}\" (expected split, trim, prefix or suffix)"),
+        };
+        Ok(filter)
+    }
+
+    /// The filter as written, for messages.
+    fn text(&self) -> String {
+        match self {
+            Filter::Split { separator, index } => format!("split({separator:?}, {index})"),
+            Filter::Trim => "trim".to_string(),
+            Filter::Prefix(prefix) => format!("prefix({prefix:?})"),
+            Filter::Suffix(suffix) => format!("suffix({suffix:?})"),
+        }
+    }
+
+    fn apply(&self, value: &str) -> Result<String> {
+        let result = match self {
+            Filter::Split { separator, index } => {
+                let parts: Vec<_> = value.split(separator.as_str()).collect();
+                let position = if *index < 0 {
+                    parts.len() as i64 + index
+                } else {
+                    *index
+                };
+                usize::try_from(position)
+                    .ok()
+                    .and_then(|position| parts.get(position))
+                    .map(|part| part.to_string())
+                    .with_context(|| {
+                        let count = parts.len();
+                        let noun = if count == 1 { "part" } else { "parts" };
+                        format!("{value:?} gives {count} {noun}")
+                    })
+            }
+            Filter::Trim => Ok(value.trim().to_string()),
+            Filter::Prefix(prefix) => value
+                .strip_prefix(prefix.as_str())
+                .map(str::to_string)
+                .with_context(|| format!("{value:?} does not start with {prefix:?}")),
+            Filter::Suffix(suffix) => value
+                .strip_suffix(suffix.as_str())
+                .map(str::to_string)
+                .with_context(|| format!("{value:?} does not end with {suffix:?}")),
+        };
+        result.with_context(|| self.text())
+    }
+}
+
+/// Parses comma-separated filter arguments: double-quoted strings (with `\"`
+/// and `\\` escapes) and integers.
+fn parse_args(text: &str) -> Result<Vec<Arg>> {
+    let mut args = Vec::new();
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        return Ok(args);
+    }
+    loop {
+        if let Some(after) = rest.strip_prefix('"') {
+            let mut value = String::new();
+            let mut chars = after.char_indices();
+            let end = loop {
+                match chars.next() {
+                    Some((_, '\\')) => match chars.next() {
+                        Some((_, c @ ('"' | '\\'))) => value.push(c),
+                        _ => bail!("only \\\" and \\\\ escapes are supported"),
+                    },
+                    Some((i, '"')) => break i,
+                    Some((_, c)) => value.push(c),
+                    None => bail!("unterminated string"),
+                }
+            };
+            args.push(Arg::Text(value));
+            rest = after[end + 1..].trim_start();
+        } else {
+            let end = rest.find(',').unwrap_or(rest.len());
+            let number = rest[..end].trim();
+            let number = number
+                .parse()
+                .with_context(|| format!("expected a \"string\" or an integer: {number}"))?;
+            args.push(Arg::Int(number));
+            rest = &rest[end..];
+        }
+        if rest.is_empty() {
+            return Ok(args);
+        }
+        rest = rest
+            .strip_prefix(',')
+            .context("expected \",\" between arguments")?
+            .trim_start();
+    }
 }
 
 /// The path after the loop variable in `{{VAR...}}`, or `None` when `name`
@@ -378,7 +584,7 @@ impl HttpFile {
             let response = responses
                 .get(&reference.name)
                 .with_context(|| format!("no response from \"{}\" yet", reference.name))?;
-            reference.extract(response)
+            reference.extract(response).map(Some)
         })
     }
 
@@ -406,7 +612,7 @@ impl HttpFile {
             if !found.contains(reference) {
                 found.push(reference.clone());
             }
-            Ok(String::new())
+            Ok(None)
         })?;
         Ok(found)
     }
@@ -438,16 +644,20 @@ impl HttpFile {
         on_reference: OnReference,
     ) -> Result<Request> {
         let all = self.variables.len();
-        let url = self.substitute(&request.url, all, item, on_reference)?;
+        // While only checking, unknown values are left empty.
+        let mut substitute = |text| {
+            Ok::<_, anyhow::Error>(
+                self.substitute(text, all, item, on_reference)?
+                    .unwrap_or_default(),
+            )
+        };
+        let url = substitute(&request.url)?;
         let mut headers = Vec::with_capacity(request.headers.len());
         for (name, value) in &request.headers {
-            headers.push((
-                self.substitute(name, all, item, on_reference)?,
-                self.substitute(value, all, item, on_reference)?,
-            ));
+            headers.push((substitute(name)?, substitute(value)?));
         }
         let body = match &request.body {
-            Some(body) => Some(self.substitute(body, all, item, on_reference)?),
+            Some(body) => Some(substitute(body)?),
             None => None,
         };
         Ok(Request {
@@ -464,15 +674,17 @@ impl HttpFile {
 
     /// Replaces each `{{...}}` in `text`, seeing only the first `visible`
     /// file variables (so a variable can only reference earlier ones) and the
-    /// loop variable of `item`, if any.
+    /// loop variable of `item`, if any. `None` when a value is not known
+    /// because only the request is being checked.
     fn substitute(
         &self,
         text: &str,
         visible: usize,
         item: Option<Item>,
         on_reference: OnReference,
-    ) -> Result<String> {
+    ) -> Result<Option<String>> {
         let mut out = String::with_capacity(text.len());
+        let mut known = true;
         let mut rest = text;
         while let Some(start) = rest.find("{{") {
             out.push_str(&rest[..start]);
@@ -480,20 +692,49 @@ impl HttpFile {
             let Some(end) = after.find("}}") else {
                 bail!("unterminated \"{{{{\" in: {text}");
             };
-            out.push_str(&self.lookup(after[..end].trim(), visible, item, on_reference)?);
+            match self.lookup(after[..end].trim(), visible, item, on_reference)? {
+                Some(value) => out.push_str(&value),
+                None => known = false,
+            }
             rest = &after[end + 2..];
         }
         out.push_str(rest);
-        Ok(out)
+        Ok(known.then_some(out))
     }
 
+    /// The value of the text inside `{{...}}`, with its filters applied.
     fn lookup(
+        &self,
+        text: &str,
+        visible: usize,
+        item: Option<Item>,
+        on_reference: OnReference,
+    ) -> Result<Option<String>> {
+        let mut parts = split_pipes(text).into_iter();
+        let name = parts.next().unwrap_or_default();
+        let filters = parts
+            .map(Filter::parse)
+            .collect::<Result<Vec<_>>>()
+            .with_context(|| format!("invalid filter in {{{{{text}}}}}"))?;
+        let Some(mut value) = self.lookup_value(name, visible, item, on_reference)? else {
+            return Ok(None);
+        };
+        for filter in &filters {
+            value = filter
+                .apply(&value)
+                .with_context(|| format!("{{{{{text}}}}}"))?;
+        }
+        Ok(Some(value))
+    }
+
+    /// The value of a variable, loop variable or response reference.
+    fn lookup_value(
         &self,
         name: &str,
         visible: usize,
         item: Option<Item>,
         on_reference: OnReference,
-    ) -> Result<String> {
+    ) -> Result<Option<String>> {
         if let Some(dynamic) = name.strip_prefix('$') {
             let Some(var) = dynamic
                 .strip_prefix("env")
@@ -503,6 +744,7 @@ impl HttpFile {
             };
             let var = var.trim();
             return std::env::var(var)
+                .map(Some)
                 .with_context(|| format!("environment variable not set: {var}"));
         }
         // The loop variable shadows requests with the same name.
@@ -510,10 +752,10 @@ impl HttpFile {
             let steps = parse_path(&format!("${path}"))
                 .with_context(|| format!("invalid loop variable reference {{{{{name}}}}}"))?;
             let Some(element) = item.element else {
-                return Ok(String::new());
+                return Ok(None);
             };
             return walk(element, &steps)
-                .map(json_text)
+                .map(|value| Some(json_text(value)))
                 .with_context(|| format!("current element has no value at {{{{{name}}}}}"));
         }
         if let Some(reference) = Reference::parse(name) {
@@ -529,8 +771,9 @@ impl HttpFile {
     }
 }
 
-/// Supplies the value of each response reference met while substituting.
-type OnReference<'a> = &'a mut dyn FnMut(&Reference) -> Result<String>;
+/// Supplies the value of each response reference met while substituting, or
+/// `None` while only checking.
+type OnReference<'a> = &'a mut dyn FnMut(&Reference) -> Result<Option<String>>;
 
 /// Splits on whitespace, except inside `{{...}}` (as in `{{$env NAME}}`).
 fn split_request_line(line: &str) -> Vec<&str> {
@@ -632,6 +875,14 @@ mod tests {
                 ("Location".into(), "/next".into()),
                 ("x-dup".into(), "first".into()),
                 ("X-Dup".into(), "second".into()),
+                ("Set-Cookie".into(), "session=old; Path=/".into()),
+                ("set-cookie".into(), " theme = \"dark\" ; Secure".into()),
+                (
+                    "set-cookie".into(),
+                    "session=abc123; Path=/; HttpOnly".into(),
+                ),
+                ("set-cookie".into(), "empty=; Max-Age=0".into()),
+                ("set-cookie".into(), "invalid".into()),
             ],
             body: body.as_bytes().to_vec(),
         }
@@ -672,6 +923,23 @@ mod tests {
     }
 
     #[test]
+    fn extracts_cookie_values() {
+        let response = captured("");
+        let cases = [
+            ("login.response.cookies.session", "abc123"),
+            ("login.response.cookies.theme", "dark"),
+            ("login.response.cookies.empty", ""),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                reference(text).unwrap().extract(&response).unwrap(),
+                expected,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn name_is_everything_before_response() {
         let r = reference("create item.v2.response.headers.Location").unwrap();
         assert_eq!(r.name, "create item.v2");
@@ -699,6 +967,11 @@ mod tests {
             err("a.response.headers.Nope", &response),
             "response of \"a\" has no header Nope"
         );
+        // Cookie names are case-sensitive.
+        assert_eq!(
+            err("a.response.cookies.Session", &response),
+            "response of \"a\" sets no cookie Session"
+        );
         assert_eq!(
             err("a.response.body.$.x", &captured("not json")),
             "response body of \"a\" is not JSON"
@@ -716,6 +989,8 @@ mod tests {
             "a.response.body.$[?(@.id)]",
             "a.response.body.$['open",
             "a.response.headers.",
+            "a.response.cookies.",
+            "a.response.cookie.session",
             "a.response.status",
         ] {
             let err = format!("{:#}", reference(text).unwrap_err());
@@ -798,6 +1073,14 @@ mod tests {
             (
                 "# @foreach x in {{a.response.headers.Link}}\nGET http://a\n",
                 "line 1: @foreach must loop over a response body, not a header",
+            ),
+            (
+                "# @foreach x in {{a.response.cookies.ids}}\nGET http://a\n",
+                "line 1: @foreach must loop over a response body, not a cookie",
+            ),
+            (
+                "# @foreach x in {{a.response.body.$.ids | trim}}\nGET http://a\n",
+                "line 1: @foreach cannot use filters",
             ),
             (
                 "# @foreach x in {{a.response.body.$.*}}\nGET http://a\n",
@@ -889,6 +1172,169 @@ mod tests {
             plain.loop_items(&plain.requests[0], &responses).unwrap(),
             None
         );
+    }
+
+    /// Resolves `GET http://a/{{expr}}` against `captured(BODY)` as "login",
+    /// returning the substituted path.
+    fn filtered(variables: &str, expr: &str) -> Result<String> {
+        let file = parse(&format!("{variables}GET http://a/{{{{{expr}}}}}\n"))?;
+        let responses = HashMap::from([("login".to_string(), captured(BODY))]);
+        file.references(&file.requests[0])?;
+        let r = file.resolve(&file.requests[0], &responses, None)?;
+        Ok(r.url.strip_prefix("http://a/").unwrap().to_string())
+    }
+
+    #[test]
+    fn filters_transform_values() {
+        let cases = [
+            (r#"login.response.headers.Location | split("/", 1)"#, "next"),
+            (
+                r#"login.response.headers.Location | split("/", -1)"#,
+                "next",
+            ),
+            (r#"login.response.headers.Location | split("/", 0)"#, ""),
+            (r#"login.response.headers.Location | prefix("/")"#, "next"),
+            (r#"login.response.headers.Location | suffix("xt")"#, "/ne"),
+            (
+                r#"login.response.headers.Location|prefix("/")|suffix("t")"#,
+                "nex",
+            ),
+            (r#"login.response.cookies.session | split("1", -1)"#, "23"),
+            (r#"login.response.body.$.token | split("0", 0)"#, "t"),
+            (r#"login.response.body.$['a.b'] | split("\"", 1)"#, "c d"),
+            (r#"v | trim"#, "a|b, \"c\""),
+            (r#"v | trim()"#, "a|b, \"c\""),
+            (r#"v | split("|", 0)"#, "a"),
+            (
+                r#"v | split(", ", -1) | trim | prefix("\"") | suffix("\"")"#,
+                "c",
+            ),
+            (r#"v|split("\\", 0)"#, "a|b, \"c\""),
+            (r#"from_v | prefix("x-")"#, "a"),
+        ];
+        let variables = "@v =  a|b, \"c\" \n@from_v = {{v | trim | split(\"|\", 0) | prefix(\"a\") | suffix(\"\")}}x-a\n";
+        for (expr, expected) in cases {
+            assert_eq!(filtered(variables, expr).unwrap(), expected, "{expr}");
+        }
+    }
+
+    #[test]
+    fn filters_apply_to_loop_and_env_values() {
+        // `}}` inside a filter argument ends the `{{...}}` early.
+        let file = parse(&format!(
+            "{LOOP}X-Last: {{{{ item | suffix(\"}}}}\") }}}}\n"
+        ))
+        .unwrap();
+        let err = format!("{:#}", file.references(&file.requests[0]).unwrap_err());
+        assert!(err.contains("missing \")\""), "{err}");
+
+        let file = parse(&format!(
+            "{LOOP}X-Last: {{{{ item | split(\":\", -1) | prefix(\"\") }}}}\n"
+        ))
+        .unwrap();
+        let responses = HashMap::from([("login".to_string(), captured(BODY))]);
+        let element = serde_json::json!({ "id": 7 });
+        let r = file
+            .resolve(&file.requests[0], &responses, Some(&element))
+            .unwrap();
+        assert_eq!(r.headers[1], ("X-Last".into(), "7}".into()));
+
+        // SAFETY: tests that read this variable do not run concurrently.
+        unsafe { std::env::set_var("AXON_FILTER_TEST", "  padded  ") };
+        assert_eq!(
+            filtered("", "$env AXON_FILTER_TEST | trim").unwrap(),
+            "padded"
+        );
+    }
+
+    #[test]
+    fn invalid_filters_are_reported_when_checking() {
+        for (expr, expected) in [
+            (
+                "v | splitt",
+                "unknown filter \"splitt\" (expected split, trim, prefix or suffix)",
+            ),
+            (
+                "v || trim",
+                "unknown filter \"\" (expected split, trim, prefix or suffix)",
+            ),
+            ("v | split", "split takes a separator and an index"),
+            (r#"v | split("/")"#, "split takes a separator and an index"),
+            (
+                r#"v | split("", 0)"#,
+                "split takes a separator and an index",
+            ),
+            (
+                r#"v | split(0, "/")"#,
+                "split takes a separator and an index",
+            ),
+            (
+                r#"v | split("/", 1.5)"#,
+                "invalid arguments in split(\"/\", 1.5): expected a \"string\" or an integer: 1.5",
+            ),
+            (r#"v | split("/" 1)"#, "expected \",\" between arguments"),
+            (
+                r#"v | split("/", 1"#,
+                "missing \")\" in filter split(\"/\", 1",
+            ),
+            (
+                r#"v | prefix("a\n")"#,
+                "only \\\" and \\\\ escapes are supported",
+            ),
+            (r#"v | prefix("a)"#, "unterminated string"),
+            ("v | prefix", "prefix takes one string"),
+            (r#"v | suffix("a", "b")"#, "suffix takes one string"),
+            (r#"v | trim("a")"#, "trim takes no arguments"),
+        ] {
+            let err = format!(
+                "{:#}",
+                resolved(&format!("@v = x\nGET http://a/{{{{{expr}}}}}\n")).unwrap_err()
+            );
+            assert!(
+                err.starts_with(&format!("invalid filter in {{{{{expr}}}}}")),
+                "{expr}: {err}"
+            );
+            assert!(err.contains(expected), "{expr}: {err}");
+        }
+    }
+
+    #[test]
+    fn filter_errors_name_the_value() {
+        for (expr, expected) in [
+            (
+                r#"login.response.headers.Location | split("/", 2)"#,
+                r#"{{login.response.headers.Location | split("/", 2)}}: split("/", 2): "/next" gives 2 parts"#,
+            ),
+            (
+                r#"login.response.headers.Location | split("/", -3)"#,
+                r#"{{login.response.headers.Location | split("/", -3)}}: split("/", -3): "/next" gives 2 parts"#,
+            ),
+            (
+                r#"login.response.cookies.session | prefix("xyz")"#,
+                r#"{{login.response.cookies.session | prefix("xyz")}}: prefix("xyz"): "abc123" does not start with "xyz""#,
+            ),
+            (
+                r#"login.response.cookies.session | suffix("abc")"#,
+                r#"{{login.response.cookies.session | suffix("abc")}}: suffix("abc"): "abc123" does not end with "abc""#,
+            ),
+        ] {
+            assert_eq!(format!("{:#}", filtered("", expr).unwrap_err()), expected);
+        }
+    }
+
+    #[test]
+    fn checking_does_not_apply_filters_to_unknown_values() {
+        let file = parse(
+            "@id = {{login.response.headers.Location | split(\"/\", 5)}}\nGET http://a/{{id | prefix(\"x\")}}/{{other.response.body.$ | split(\",\", 9)}}\n",
+        )
+        .unwrap();
+        let names: Vec<_> = file
+            .references(&file.requests[0])
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(names, ["login", "other"]);
     }
 
     #[test]
