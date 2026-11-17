@@ -1317,3 +1317,189 @@ fn invalid_method() {
 
     assert_error(&r, "invalid method");
 }
+
+// --- checks ----------------------------------------------------------------
+
+/// Runs `-f <file with contents> args...` without adding `--json`, returning
+/// the exit code, stdout and the stderr lines.
+fn run_raw(test: &str, contents: &str, args: &[&str]) -> (i32, String, Vec<String>) {
+    let file = http_file(test, contents);
+    let output = Command::new(env!("CARGO_BIN_EXE_axon-cli"))
+        .args(["-f", file.as_str()])
+        .args(args)
+        .env("HOME", temp_dir("empty-home"))
+        .output()
+        .unwrap();
+    (
+        output.status.code().expect("process exited normally"),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+const CHECKS: &str = "\
+### list
+# @assert status == 200
+# @assert {{response.body.$.users[1].name}} == \"bob\"
+# @assert {{response.headers.Content-Type}} contains \"json\"
+# @warn {{response.body.$.users}} !contains \"carl\"
+# @warn {{response.body.$.one}} == \"y\"
+# @notice {{response.cookies.theme}} != \"dark\"
+GET BASE/list
+";
+
+#[test]
+fn passing_and_reported_checks() {
+    let base = start_server();
+    let file = CHECKS.replace("BASE", &base);
+    let (code, stdout, stderr) = run_raw("checks-levels", &file, &["-n", "list"]);
+
+    assert_eq!(code, 0, "{stderr:?}");
+    assert!(stdout.starts_with("< HTTP/1.1 200 OK\n"), "{stdout}");
+    assert_eq!(
+        stderr,
+        [
+            "WARN request \"list\": {{response.body.$.one}} == \"y\": got \"x\"",
+            "NOTICE request \"list\": {{response.cookies.theme}} != \"dark\": got \"dark\"",
+        ]
+    );
+
+    // --strict makes the warning fail the run, but not the notice.
+    let (code, _, stderr) = run_raw("checks-strict", &file, &["-n", "list", "--strict"]);
+    assert_eq!(code, 1);
+    assert_eq!(stderr.len(), 3, "{stderr:?}");
+    assert_eq!(stderr[2], r#"{"error":"1 check failed"}"#);
+}
+
+#[test]
+fn checks_in_json_output() {
+    let base = start_server();
+    let file = CHECKS.replace("BASE", &base);
+    let (code, stdout, _) = run_raw("checks-json", &file, &["-n", "list", "--json"]);
+
+    assert_eq!(code, 0);
+    let output: Value = serde_json::from_str(&stdout).unwrap();
+    let checks = &output["checks"];
+    assert_eq!(checks.as_array().unwrap().len(), 6);
+    assert_eq!(
+        checks[0],
+        json!({"level": "assert", "check": "status == 200", "ok": true})
+    );
+    assert_eq!(
+        checks[4],
+        json!({"level": "warn", "check": "{{response.body.$.one}} == \"y\"", "ok": false, "error": "got \"x\""})
+    );
+    assert_eq!(checks[5]["level"], "notice");
+
+    // A request without checks has no "checks" field.
+    let (_, stdout, _) = run_raw(
+        "checks-json-none",
+        &format!("### t\nGET {base}/text\n"),
+        &["-n", "t", "--json"],
+    );
+    let output: Value = serde_json::from_str(&stdout).unwrap();
+    assert!(output.get("checks").is_none(), "{output}");
+}
+
+const FAILING: &str = "\
+### missing
+# @assert status == 200
+# @assert {{response.body.$.id}} exists
+GET BASE/missing
+
+### uses missing
+GET BASE/echo?type={{missing.response.headers.Content-Type}}
+
+### uses uses missing
+GET BASE/echo?u={{uses missing.response.body.$.method}}
+
+### independent
+GET BASE/text
+";
+
+#[test]
+fn failed_assert_skips_dependents_only() {
+    let base = start_server();
+    let file = FAILING.replace("BASE", &base);
+    let args = ["-n", "uses uses missing", "-n", "independent"];
+    let (code, stdout, stderr) = run_raw("checks-skip", &file, &args);
+
+    assert_eq!(code, 1);
+    assert_eq!(
+        stderr,
+        [
+            "FAIL request \"missing\": status == 200: got \"404\"",
+            "FAIL request \"missing\": {{response.body.$.id}} exists: response body is not JSON: expected ident at line 1 column 2",
+            "SKIP request \"uses missing\": \"missing\" failed its checks",
+            "SKIP request \"uses uses missing\": \"uses missing\" failed its checks",
+            r#"{"error":"2 checks failed, 2 requests skipped"}"#,
+        ]
+    );
+    // The failing response and the independent one are still printed.
+    assert!(stdout.starts_with("< HTTP/1.1 404 Not Found\n"), "{stdout}");
+    assert!(stdout.ends_with("hello text"), "{stdout}");
+
+    // With --json, a skipped -n takes its slot as null.
+    let mut json_args = args.to_vec();
+    json_args.push("--json");
+    let (code, stdout, _) = run_raw("checks-skip-json", &file, &json_args);
+    assert_eq!(code, 1);
+    let output: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(output[0], Value::Null);
+    assert_eq!(output[1]["body"], "hello text");
+}
+
+#[test]
+fn every_loop_iteration_is_checked() {
+    let base = start_server();
+    let file = format!(
+        "\
+### list
+GET {base}/list
+
+### each
+# @foreach user in {{{{list.response.body.$.users}}}}
+# @assert {{{{response.body.$.method}}}} == \"GET\"
+# @assert {{{{user.id}}}} == 2
+# @notice {{{{user.name}}}} != \"bob\"
+GET {base}/echo/{{{{user.id}}}}
+"
+    );
+    let (code, stdout, stderr) = run_raw("checks-loop", &file, &["-n", "each", "-b"]);
+
+    assert_eq!(code, 1);
+    assert_eq!(
+        stderr,
+        [
+            "FAIL request \"each\" (element 0): {{user.id}} == 2: got \"1\"",
+            "NOTICE request \"each\" (element 1): {{user.name}} != \"bob\": got \"bob\"",
+            r#"{"error":"1 check failed"}"#,
+        ]
+    );
+    // Both iterations were sent.
+    assert_eq!(stdout.matches("\"method\":\"GET\"").count(), 2, "{stdout}");
+}
+
+#[test]
+fn invalid_checks_fail_before_sending() {
+    let base = start_server();
+    for (check, error) in [
+        (
+            "# @assert {{nope}} exists",
+            "request \"r\": @assert {{nope}} exists: undefined variable: nope",
+        ),
+        ("# @warn status =~ 200", "failed to parse"),
+    ] {
+        let file = format!("### r\n{check}\nGET {base}/text\n");
+        let (code, stdout, stderr) = run_raw("checks-invalid", &file, &["-n", "r"]);
+        assert_eq!(code, 1);
+        assert_eq!(stdout, "");
+        assert_eq!(stderr.len(), 1, "{stderr:?}");
+        let message: Value = serde_json::from_str(&stderr[0]).unwrap();
+        let message = message["error"].as_str().unwrap();
+        assert!(message.starts_with(error), "{message}");
+    }
+}

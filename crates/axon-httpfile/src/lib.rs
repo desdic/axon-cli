@@ -3,7 +3,8 @@
 //! `{{var}}` / `{{$env NAME}}` substitution, and response chaining with
 //! `{{NAME.response.body.$.path}}` / `{{NAME.response.headers.Header}}` /
 //! `{{NAME.response.cookies.Cookie}}`, filters such as
-//! `{{value | split("/", -1) | trim}}`, and loops with `# @foreach VAR in {{NAME.response.body.$.path}}`.
+//! `{{value | split("/", -1) | trim}}`, loops with `# @foreach VAR in {{NAME.response.body.$.path}}`,
+//! and response checks with `# @assert`, `# @warn` and `# @notice`.
 
 use std::collections::HashMap;
 
@@ -27,6 +28,8 @@ pub struct Request {
     pub body: Option<String>,
     /// Set by `# @foreach VAR in {{...}}`: the request runs once per element.
     pub foreach: Option<Foreach>,
+    /// `# @assert`, `# @warn` and `# @notice` checks, in the order written.
+    pub checks: Vec<Check>,
     /// 1-based lines of the request's block: from its `###` separator (or the
     /// start of the file) up to the line before the next separator.
     pub start_line: usize,
@@ -38,9 +41,72 @@ pub struct Request {
 /// named NAME.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Reference {
-    /// Name of the referenced request.
+    /// Name of the referenced request; empty for `{{response...}}` in a
+    /// check, which reads the checked request's own response.
     pub name: String,
     part: Part,
+}
+
+/// How a failed check counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Level {
+    /// `@assert`: fails the run.
+    Assert,
+    /// `@warn`: reported; fails the run only with `--strict`.
+    Warn,
+    /// `@notice`: reported, never fails the run.
+    Notice,
+}
+
+impl Level {
+    const ALL: [Level; 3] = [Level::Assert, Level::Warn, Level::Notice];
+
+    /// The directive keyword, without `@`.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Level::Assert => "assert",
+            Level::Warn => "warn",
+            Level::Notice => "notice",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Op {
+    Eq,
+    Ne,
+    Contains,
+    NotContains,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Exists,
+    NotExists,
+}
+
+/// A `# @assert SUBJECT OPERATOR [EXPECTED]` line (or `@warn`, `@notice`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Check {
+    pub level: Level,
+    /// The check as written after the keyword, for messages.
+    pub text: String,
+    /// One `{{...}}`, as written; `status` is `{{response.status}}`.
+    subject: String,
+    op: Op,
+    /// Text to substitute and compare with, its quotes removed; `None` for
+    /// `exists` and `!exists`.
+    expected: Option<String>,
+}
+
+/// The outcome of one check against one response.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheckResult {
+    pub level: Level,
+    /// The check as written after the keyword.
+    pub text: String,
+    /// Why the check failed; `None` when it passed.
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -53,6 +119,8 @@ enum Part {
     Header(String),
     /// A cookie set by a `Set-Cookie` header, by name.
     Cookie(String),
+    /// The status code; only in checks, as `{{response.status}}`.
+    Status,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -100,11 +168,49 @@ struct Item<'a> {
     element: Option<&'a Value>,
 }
 
+/// What a `{{...}}` can see besides file variables, `$env` and other
+/// requests' responses.
+#[derive(Clone, Copy, Default)]
+struct Scope<'a> {
+    /// The loop variable of a looping request.
+    item: Option<Item<'a>>,
+    /// In a check, the request's own response, read by `{{response...}}`
+    /// (`Some(None)` when only checking).
+    own: Option<Option<&'a Captured>>,
+}
+
 /// The parts of a received response that references can read.
 #[derive(Clone, Debug, Default)]
 pub struct Captured {
+    pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+/// Parses what follows `.response.` (or `response.` in a check); `own`
+/// allows `status`, which only checks can read.
+fn parse_part(rest: &str, own: bool) -> Result<Part> {
+    if let Some(path) = rest.strip_prefix("body.") {
+        return parse_path(path).map(|steps| Part::Body {
+            path: path.to_string(),
+            steps,
+        });
+    }
+    if let Some(header) = rest.strip_prefix("headers.").filter(|h| !h.is_empty()) {
+        return Ok(Part::Header(header.to_string()));
+    }
+    if let Some(cookie) = rest.strip_prefix("cookies.").filter(|c| !c.is_empty()) {
+        return Ok(Part::Cookie(cookie.to_string()));
+    }
+    if own && rest == "status" {
+        return Ok(Part::Status);
+    }
+    if own {
+        bail!(
+            "expected \"body.$...\", \"headers.NAME\", \"cookies.NAME\" or \"status\" after \"response.\""
+        );
+    }
+    bail!("expected \"body.$...\", \"headers.NAME\" or \"cookies.NAME\" after \".response.\"")
 }
 
 impl Reference {
@@ -112,27 +218,36 @@ impl Reference {
     /// is not a response reference. NAME is everything before `.response.`.
     fn parse(text: &str) -> Option<Result<Self>> {
         let (name, rest) = text.split_once(".response.")?;
-        let part = if let Some(path) = rest.strip_prefix("body.") {
-            parse_path(path).map(|steps| Part::Body {
-                path: path.to_string(),
-                steps,
-            })
-        } else if let Some(header) = rest.strip_prefix("headers.").filter(|h| !h.is_empty()) {
-            Ok(Part::Header(header.to_string()))
-        } else if let Some(cookie) = rest.strip_prefix("cookies.").filter(|c| !c.is_empty()) {
-            Ok(Part::Cookie(cookie.to_string()))
-        } else {
-            Err(anyhow::anyhow!(
-                "expected \"body.$...\", \"headers.NAME\" or \"cookies.NAME\" after \".response.\""
-            ))
-        };
         Some(
-            part.map(|part| Reference {
-                name: name.to_string(),
-                part,
-            })
-            .with_context(|| format!("invalid response reference {{{{{text}}}}}")),
+            parse_part(rest, false)
+                .map(|part| Reference {
+                    name: name.to_string(),
+                    part,
+                })
+                .with_context(|| format!("invalid response reference {{{{{text}}}}}")),
         )
+    }
+
+    /// Parses a check's `response.…` reference to its own response.
+    fn parse_own(text: &str) -> Option<Result<Self>> {
+        let rest = text.strip_prefix("response.")?;
+        Some(
+            parse_part(rest, true)
+                .map(|part| Reference {
+                    name: String::new(),
+                    part,
+                })
+                .with_context(|| format!("invalid response reference {{{{{text}}}}}")),
+        )
+    }
+
+    /// `response of "NAME"`, or `response` for the checked request's own.
+    fn whose(&self, what: &str) -> String {
+        if self.name.is_empty() {
+            what.to_string()
+        } else {
+            format!("{what} of \"{}\"", self.name)
+        }
     }
 
     /// The referenced value as text: a JSON string without quotes, any other
@@ -145,14 +260,15 @@ impl Reference {
 
     /// The referenced value; a header or cookie value is a JSON string.
     fn value(&self, response: &Captured) -> Result<Value> {
-        let name = &self.name;
+        let whose = self.whose("response");
         match &self.part {
+            Part::Status => Ok(Value::from(response.status)),
             Part::Header(header) => response
                 .headers
                 .iter()
                 .find(|(n, _)| n.eq_ignore_ascii_case(header))
                 .map(|(_, value)| Value::String(value.clone()))
-                .with_context(|| format!("response of \"{name}\" has no header {header}")),
+                .with_context(|| format!("{whose} has no header {header}")),
             Part::Cookie(cookie) => response
                 .headers
                 .iter()
@@ -161,23 +277,30 @@ impl Reference {
                 .filter_map(|(_, value)| set_cookie_pair(value))
                 .find(|(n, _)| n == cookie)
                 .map(|(_, value)| Value::String(value.to_string()))
-                .with_context(|| format!("response of \"{name}\" sets no cookie {cookie}")),
+                .with_context(|| format!("{whose} sets no cookie {cookie}")),
             Part::Body { path, steps } => {
+                let body = self.whose("response body");
                 let json: Value = serde_json::from_slice(&response.body)
-                    .with_context(|| format!("response body of \"{name}\" is not JSON"))?;
+                    .with_context(|| format!("{body} is not JSON"))?;
                 walk(&json, steps)
                     .cloned()
-                    .with_context(|| format!("response body of \"{name}\" has no value at {path}"))
+                    .with_context(|| format!("{body} has no value at {path}"))
             }
         }
     }
 
     /// The reference as written, for messages.
     fn text(&self) -> String {
+        let response = if self.name.is_empty() {
+            "response".to_string()
+        } else {
+            format!("{}.response", self.name)
+        };
         match &self.part {
-            Part::Body { path, .. } => format!("{}.response.body.{path}", self.name),
-            Part::Header(header) => format!("{}.response.headers.{header}", self.name),
-            Part::Cookie(cookie) => format!("{}.response.cookies.{cookie}", self.name),
+            Part::Body { path, .. } => format!("{response}.body.{path}"),
+            Part::Header(header) => format!("{response}.headers.{header}"),
+            Part::Cookie(cookie) => format!("{response}.cookies.{cookie}"),
+            Part::Status => format!("{response}.status"),
         }
     }
 }
@@ -249,6 +372,7 @@ fn parse_foreach(text: &str) -> Result<Foreach> {
         Part::Body { .. } => None,
         Part::Header(_) => Some("header"),
         Part::Cookie(_) => Some("cookie"),
+        Part::Status => Some("status"),
     };
     if let Some(kind) = kind {
         bail!(
@@ -374,21 +498,9 @@ fn parse_args(text: &str) -> Result<Vec<Arg>> {
     }
     loop {
         if let Some(after) = rest.strip_prefix('"') {
-            let mut value = String::new();
-            let mut chars = after.char_indices();
-            let end = loop {
-                match chars.next() {
-                    Some((_, '\\')) => match chars.next() {
-                        Some((_, c @ ('"' | '\\'))) => value.push(c),
-                        _ => bail!("only \\\" and \\\\ escapes are supported"),
-                    },
-                    Some((i, '"')) => break i,
-                    Some((_, c)) => value.push(c),
-                    None => bail!("unterminated string"),
-                }
-            };
+            let (value, after) = parse_quoted(after)?;
             args.push(Arg::Text(value));
-            rest = after[end + 1..].trim_start();
+            rest = after.trim_start();
         } else {
             let end = rest.find(',').unwrap_or(rest.len());
             let number = rest[..end].trim();
@@ -406,6 +518,136 @@ fn parse_args(text: &str) -> Result<Vec<Arg>> {
             .context("expected \",\" between arguments")?
             .trim_start();
     }
+}
+
+/// Reads a double-quoted string (with `\"` and `\\` escapes) whose opening
+/// quote has been stripped, returning its value and the text after the
+/// closing quote.
+fn parse_quoted(after: &str) -> Result<(String, &str)> {
+    let mut value = String::new();
+    let mut chars = after.char_indices();
+    loop {
+        match chars.next() {
+            Some((_, '\\')) => match chars.next() {
+                Some((_, c @ ('"' | '\\'))) => value.push(c),
+                _ => bail!("only \\\" and \\\\ escapes are supported"),
+            },
+            Some((i, '"')) => return Ok((value, &after[i + 1..])),
+            Some((_, c)) => value.push(c),
+            None => bail!("unterminated string"),
+        }
+    }
+}
+
+/// Parses the text after `@assert`, `@warn` or `@notice`:
+/// `SUBJECT OPERATOR [EXPECTED]`.
+fn parse_check(level: Level, text: &str) -> Result<Check> {
+    let keyword = level.keyword();
+    let invalid = |why: String| anyhow::anyhow!("invalid @{keyword} ({why}): @{keyword} {text}");
+    let (subject, rest) = if let Some(after) = text.strip_prefix("{{") {
+        let end = after
+            .find("}}")
+            .ok_or_else(|| invalid("unterminated \"{{\"".to_string()))?;
+        (text[..end + 4].to_string(), &after[end + 2..])
+    } else if let Some(rest) = text
+        .strip_prefix("status")
+        .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+    {
+        ("{{response.status}}".to_string(), rest)
+    } else {
+        return Err(invalid("expected status or {{...}} first".to_string()));
+    };
+    let rest = rest.trim();
+    let (op_text, expected) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, ""), |(op, expected)| (op, expected.trim()));
+    let op = match op_text {
+        "==" => Op::Eq,
+        "!=" => Op::Ne,
+        "contains" => Op::Contains,
+        "!contains" => Op::NotContains,
+        "<" => Op::Lt,
+        "<=" => Op::Le,
+        ">" => Op::Gt,
+        ">=" => Op::Ge,
+        "exists" => Op::Exists,
+        "!exists" => Op::NotExists,
+        "" => return Err(invalid("missing operator".to_string())),
+        other => {
+            return Err(invalid(format!(
+                "unknown operator \"{other}\"; expected ==, !=, contains, !contains, <, <=, >, >=, exists or !exists"
+            )));
+        }
+    };
+    let expected = match (
+        matches!(op, Op::Exists | Op::NotExists),
+        expected.is_empty(),
+    ) {
+        (true, true) => None,
+        (true, false) => return Err(invalid(format!("{op_text} takes no value"))),
+        (false, true) => return Err(invalid(format!("{op_text} needs a value"))),
+        (false, false) => Some(match expected.strip_prefix('"') {
+            Some(after) => {
+                let (value, rest) = parse_quoted(after).map_err(|e| invalid(e.to_string()))?;
+                if !rest.trim().is_empty() {
+                    return Err(invalid(format!(
+                        "unexpected text after the closing quote: {}",
+                        rest.trim()
+                    )));
+                }
+                value
+            }
+            None => expected.to_string(),
+        }),
+    };
+    Ok(Check {
+        level,
+        text: text.to_string(),
+        subject,
+        op,
+        expected,
+    })
+}
+
+impl Check {
+    /// Compares the subject with the expected value; `eval` substitutes a
+    /// `{{...}}` text. The error says why the check failed.
+    fn evaluate(&self, eval: &mut dyn FnMut(&str) -> Result<String>) -> Result<()> {
+        let subject = eval(&self.subject);
+        let got = |value: &str| anyhow::anyhow!("got {value:?}");
+        let actual = match (self.op, subject) {
+            (Op::Exists, subject) => return subject.map(drop),
+            (Op::NotExists, Ok(value)) => return Err(got(&value)),
+            (Op::NotExists, Err(_)) => return Ok(()),
+            (_, subject) => subject?,
+        };
+        let expected = eval(self.expected.as_deref().unwrap_or_default())?;
+        let pass = match self.op {
+            Op::Eq => actual == expected,
+            Op::Ne => actual != expected,
+            Op::Contains => actual.contains(&expected),
+            Op::NotContains => !actual.contains(&expected),
+            op => {
+                let (a, e) = (number(&actual)?, number(&expected)?);
+                match op {
+                    Op::Lt => a < e,
+                    Op::Le => a <= e,
+                    Op::Gt => a > e,
+                    _ => a >= e,
+                }
+            }
+        };
+        if pass { Ok(()) } else { Err(got(&actual)) }
+    }
+}
+
+/// A finite number, for `<`, `<=`, `>` and `>=`.
+fn number(text: &str) -> Result<f64> {
+    text.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite())
+        .with_context(|| format!("not a number: {text:?}"))
 }
 
 /// The path after the loop variable in `{{VAR...}}`, or `None` when `name`
@@ -484,8 +726,10 @@ impl HttpFile {
     ) -> Result<()> {
         let mut lines = lines.iter();
         let mut foreach = None;
+        let mut checks = Vec::new();
 
-        // Variables, comments, `# @name` and `# @foreach`, up to the request line.
+        // Variables, comments, `# @name`, `# @foreach` and checks, up to the
+        // request line.
         let (line_no, request_line) = loop {
             let Some(&(line_no, line)) = lines.next() else {
                 return Ok(());
@@ -499,6 +743,8 @@ impl HttpFile {
                 if foreach.replace(directive).is_some() {
                     bail!("line {line_no}: more than one @foreach in a request");
                 }
+            } else if let Some((_, check)) = check_directive(line) {
+                checks.push(check.with_context(|| format!("line {line_no}"))?);
             } else if let Some(directive) = name_directive(line) {
                 name = Some(directive);
             } else if is_comment(line) {
@@ -538,6 +784,11 @@ impl HttpFile {
             let line = line.trim();
             if line.is_empty() {
                 in_body = true;
+            } else if let Some((level, _)) = check_directive(line) {
+                bail!(
+                    "line {line_no}: @{} must come before the request line",
+                    level.keyword()
+                );
             } else if !is_comment(line) {
                 let Some((header, value)) = line.split_once(':') else {
                     bail!("line {line_no}: invalid header (expected \"Name: Value\"): {line}");
@@ -556,6 +807,7 @@ impl HttpFile {
             headers,
             body: (!body.is_empty()).then(|| body.join("\n")),
             foreach,
+            checks,
             start_line,
             end_line,
         });
@@ -593,7 +845,7 @@ impl HttpFile {
     /// order of appearance. Also checks the request's variables, like
     /// [`HttpFile::resolve`].
     pub fn references(&self, request: &Request) -> Result<Vec<Reference>> {
-        let mut found = Vec::new();
+        let mut found: Vec<Reference> = Vec::new();
         let mut item = None;
         if let Some(foreach) = &request.foreach {
             if self.variables.iter().any(|(name, _)| *name == foreach.var) {
@@ -608,13 +860,72 @@ impl HttpFile {
                 element: None,
             });
         }
-        self.substitute_request(request, item, &mut |reference| {
+        let mut collect = |reference: &Reference| -> Result<Option<String>> {
             if !found.contains(reference) {
                 found.push(reference.clone());
             }
             Ok(None)
-        })?;
+        };
+        self.substitute_request(request, item, &mut collect)?;
+        // A check's `{{response...}}` is its own response, not a dependency.
+        let scope = Scope {
+            item,
+            own: Some(None),
+        };
+        for check in &request.checks {
+            for text in [Some(&check.subject), check.expected.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                self.substitute(text, self.variables.len(), scope, &mut collect)
+                    .with_context(|| format!("@{} {}", check.level.keyword(), check.text))?;
+            }
+        }
         Ok(found)
+    }
+
+    /// Evaluates the request's checks against `response`, its own response,
+    /// with other requests' responses from `responses` and, for a looping
+    /// request, the loop variable from `element`.
+    pub fn check(
+        &self,
+        request: &Request,
+        response: &Captured,
+        responses: &HashMap<String, Captured>,
+        element: Option<&Value>,
+    ) -> Vec<CheckResult> {
+        let scope = Scope {
+            item: request
+                .foreach
+                .as_ref()
+                .zip(element)
+                .map(|(foreach, element)| Item {
+                    var: &foreach.var,
+                    element: Some(element),
+                }),
+            own: Some(Some(response)),
+        };
+        let mut on_reference = |reference: &Reference| -> Result<Option<String>> {
+            let response = responses
+                .get(&reference.name)
+                .with_context(|| format!("no response from \"{}\" yet", reference.name))?;
+            reference.extract(response).map(Some)
+        };
+        request
+            .checks
+            .iter()
+            .map(|check| {
+                let mut eval = |text: &str| {
+                    self.substitute(text, self.variables.len(), scope, &mut on_reference)
+                        .map(Option::unwrap_or_default)
+                };
+                CheckResult {
+                    level: check.level,
+                    text: check.text.clone(),
+                    error: check.evaluate(&mut eval).err().map(|e| format!("{e:#}")),
+                }
+            })
+            .collect()
     }
 
     /// For a looping request, the elements of its `@foreach` array, read from
@@ -644,10 +955,11 @@ impl HttpFile {
         on_reference: OnReference,
     ) -> Result<Request> {
         let all = self.variables.len();
+        let scope = Scope { item, own: None };
         // While only checking, unknown values are left empty.
         let mut substitute = |text| {
             Ok::<_, anyhow::Error>(
-                self.substitute(text, all, item, on_reference)?
+                self.substitute(text, all, scope, on_reference)?
                     .unwrap_or_default(),
             )
         };
@@ -667,20 +979,21 @@ impl HttpFile {
             headers,
             body,
             foreach: request.foreach.clone(),
+            checks: request.checks.clone(),
             start_line: request.start_line,
             end_line: request.end_line,
         })
     }
 
     /// Replaces each `{{...}}` in `text`, seeing only the first `visible`
-    /// file variables (so a variable can only reference earlier ones) and the
-    /// loop variable of `item`, if any. `None` when a value is not known
+    /// file variables (so a variable can only reference earlier ones) and
+    /// what `scope` adds. `None` when a value is not known
     /// because only the request is being checked.
     fn substitute(
         &self,
         text: &str,
         visible: usize,
-        item: Option<Item>,
+        scope: Scope,
         on_reference: OnReference,
     ) -> Result<Option<String>> {
         let mut out = String::with_capacity(text.len());
@@ -692,7 +1005,7 @@ impl HttpFile {
             let Some(end) = after.find("}}") else {
                 bail!("unterminated \"{{{{\" in: {text}");
             };
-            match self.lookup(after[..end].trim(), visible, item, on_reference)? {
+            match self.lookup(after[..end].trim(), visible, scope, on_reference)? {
                 Some(value) => out.push_str(&value),
                 None => known = false,
             }
@@ -707,7 +1020,7 @@ impl HttpFile {
         &self,
         text: &str,
         visible: usize,
-        item: Option<Item>,
+        scope: Scope,
         on_reference: OnReference,
     ) -> Result<Option<String>> {
         let mut parts = split_pipes(text).into_iter();
@@ -716,7 +1029,7 @@ impl HttpFile {
             .map(Filter::parse)
             .collect::<Result<Vec<_>>>()
             .with_context(|| format!("invalid filter in {{{{{text}}}}}"))?;
-        let Some(mut value) = self.lookup_value(name, visible, item, on_reference)? else {
+        let Some(mut value) = self.lookup_value(name, visible, scope, on_reference)? else {
             return Ok(None);
         };
         for filter in &filters {
@@ -732,7 +1045,7 @@ impl HttpFile {
         &self,
         name: &str,
         visible: usize,
-        item: Option<Item>,
+        scope: Scope,
         on_reference: OnReference,
     ) -> Result<Option<String>> {
         if let Some(dynamic) = name.strip_prefix('$') {
@@ -747,8 +1060,21 @@ impl HttpFile {
                 .map(Some)
                 .with_context(|| format!("environment variable not set: {var}"));
         }
+        // In a check, `{{response...}}` is the request's own response.
+        if let Some(own) = scope.own
+            && let Some(reference) = Reference::parse_own(name)
+        {
+            let reference = reference?;
+            return match own {
+                Some(response) => reference.extract(response).map(Some),
+                None => Ok(None),
+            };
+        }
         // The loop variable shadows requests with the same name.
-        if let Some((item, path)) = item.and_then(|item| Some((item, loop_path(name, item.var)?))) {
+        if let Some((item, path)) = scope
+            .item
+            .and_then(|item| Some((item, loop_path(name, item.var)?)))
+        {
             let steps = parse_path(&format!("${path}"))
                 .with_context(|| format!("invalid loop variable reference {{{{{name}}}}}"))?;
             let Some(element) = item.element else {
@@ -766,8 +1092,14 @@ impl HttpFile {
             .iter()
             .rposition(|(n, _)| n == name)
             .with_context(|| format!("undefined variable: {name}"))?;
-        // The loop variable is not visible inside file variables.
-        self.substitute(&self.variables[index].1, index, None, on_reference)
+        // The loop variable and a check's own response are not visible
+        // inside file variables.
+        self.substitute(
+            &self.variables[index].1,
+            index,
+            Scope::default(),
+            on_reference,
+        )
     }
 }
 
@@ -818,6 +1150,20 @@ fn foreach_directive(line: &str) -> Option<Result<Foreach>> {
     Some(parse_foreach(rest.trim()))
 }
 
+/// The level and parsed check of a `# @assert ...`, `# @warn ...` or
+/// `# @notice ...` line (or `//`), or `None` when the line is not a check.
+fn check_directive(line: &str) -> Option<(Level, Result<Check>)> {
+    let rest = line.strip_prefix('#').or_else(|| line.strip_prefix("//"))?;
+    let rest = rest.trim_start().strip_prefix('@')?;
+    Level::ALL.into_iter().find_map(|level| {
+        let text = rest.strip_prefix(level.keyword())?;
+        if !text.is_empty() && !text.starts_with(char::is_whitespace) {
+            return None;
+        }
+        Some((level, parse_check(level, text.trim())))
+    })
+}
+
 /// The name from a `# @name NAME` or `// @name NAME` line.
 fn name_directive(line: &str) -> Option<String> {
     let rest = line.strip_prefix('#').or_else(|| line.strip_prefix("//"))?;
@@ -855,6 +1201,7 @@ mod tests {
             headers: Vec::new(),
             body: None,
             foreach: None,
+            checks: Vec::new(),
             start_line,
             end_line,
         }
@@ -871,6 +1218,7 @@ mod tests {
 
     fn captured(body: &str) -> Captured {
         Captured {
+            status: 200,
             headers: vec![
                 ("Location".into(), "/next".into()),
                 ("x-dup".into(), "first".into()),
@@ -1527,5 +1875,222 @@ mod tests {
     fn unterminated_braces() {
         let err = resolved("GET http://a/{{oops\n").err().unwrap();
         assert!(err.to_string().starts_with("unterminated \"{{\""), "{err}");
+    }
+
+    /// Runs the first request's checks against `own`, returning each
+    /// failure as `LEVEL text: error` and passes as `ok text`.
+    fn run_checks(contents: &str, own: &Captured, element: Option<&Value>) -> Vec<String> {
+        let file = parse(contents).unwrap();
+        let request = file.requests.last().unwrap();
+        file.references(request).unwrap();
+        let mut responses = HashMap::new();
+        responses.insert("other".to_string(), captured(r#"{"id": 7}"#));
+        file.check(request, own, &responses, element)
+            .into_iter()
+            .map(|r| match r.error {
+                None => format!("ok {}", r.text),
+                Some(error) => format!("{} {}: {error}", r.level.keyword(), r.text),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parses_checks() {
+        let file = parse(concat!(
+            "### a\n",
+            "# @assert status == 200\n",
+            "// @warn {{response.headers.Content-Type | trim}} contains \"js\\\"on\"\n",
+            "#   @notice   {{response.body.$.x}}   !exists  \n",
+            "GET http://a/\n",
+        ))
+        .unwrap();
+        let checks = &file.requests[0].checks;
+        assert_eq!(checks.len(), 3);
+        assert_eq!(
+            (
+                checks[0].level,
+                checks[0].text.as_str(),
+                checks[0].subject.as_str()
+            ),
+            (Level::Assert, "status == 200", "{{response.status}}")
+        );
+        assert_eq!(checks[0].expected.as_deref(), Some("200"));
+        assert_eq!(
+            (checks[1].level, checks[1].op, checks[1].expected.as_deref()),
+            (Level::Warn, Op::Contains, Some("js\"on"))
+        );
+        assert_eq!(
+            (checks[2].level, checks[2].op, checks[2].expected.as_deref()),
+            (Level::Notice, Op::NotExists, None)
+        );
+        // `@assertion` is not a check, just a comment.
+        let file = parse("# @assertion x\nGET http://a/\n").unwrap();
+        assert!(file.requests[0].checks.is_empty());
+    }
+
+    #[test]
+    fn invalid_checks_are_errors() {
+        for (line, message) in [
+            ("@assert", "expected status or {{...}} first"),
+            ("@assert body == 1", "expected status or {{...}} first"),
+            ("@assert status==200", "expected status or {{...}} first"),
+            ("@assert {{x", "unterminated \"{{\""),
+            ("@assert status", "missing operator"),
+            ("@warn status =~ 2", "unknown operator \"=~\""),
+            ("@notice status == ", "== needs a value"),
+            ("@assert {{x}} exists 1", "exists takes no value"),
+            ("@assert status == \"200", "unterminated string"),
+            (
+                "@assert status == \"2\" 0",
+                "unexpected text after the closing quote: 0",
+            ),
+        ] {
+            let err = parse(&format!("# {line}\nGET http://a/\n")).err().unwrap();
+            let err = format!("{err:#}");
+            assert!(err.starts_with("line 1: invalid @"), "{err}");
+            assert!(err.contains(message), "{line}: {err}");
+        }
+        let err = parse("GET http://a/\n# @warn status == 200\n")
+            .err()
+            .unwrap();
+        assert_eq!(
+            err.to_string(),
+            "line 2: @warn must come before the request line"
+        );
+    }
+
+    #[test]
+    fn checks_compare_values() {
+        let mut own = captured(r#"{"id": 7, "name": "web", "count": 3, "tags": ["a"], "n": null}"#);
+        own.status = 404;
+        let results = run_checks(
+            concat!(
+                "@seven = 7\n",
+                "# @assert status == 200\n",
+                "# @assert status == 404\n",
+                "# @assert {{response.status}} >= 400\n",
+                "# @assert status < 400\n",
+                "# @assert {{response.body.$.id}} == {{seven}}\n",
+                "# @assert {{response.body.$.id}} == \"{{other.response.body.$.id}}\"\n",
+                "# @assert {{response.body.$.name}} != \"web\"\n",
+                "# @assert {{response.body.$.name}} contains \"e\"\n",
+                "# @assert {{response.body.$.name}} !contains \"e\"\n",
+                "# @assert {{response.body.$.tags}} == [\"a\"]\n",
+                "# @assert {{response.body.$.n}} == null\n",
+                "# @assert {{response.body.$.count}} > 2.5\n",
+                "# @assert {{response.body.$.name}} > 1\n",
+                "# @assert {{response.body.$.missing}} == 1\n",
+                "# @assert {{response.body.$.missing}} exists\n",
+                "# @assert {{response.body.$.missing}} !exists\n",
+                "# @assert {{response.body.$.id}} !exists\n",
+                "# @assert {{response.headers.location | split(\"/\", -1)}} == \"next\"\n",
+                "# @assert {{response.headers.Location | split(\"/\", 5)}} exists\n",
+                "# @assert {{response.cookies.session}} == \"abc123\"\n",
+                "# @assert {{response.cookies.nope}} exists\n",
+                "GET http://a/\n",
+            ),
+            &own,
+            None,
+        );
+        assert_eq!(
+            results,
+            [
+                "assert status == 200: got \"404\"",
+                "ok status == 404",
+                "ok {{response.status}} >= 400",
+                "assert status < 400: got \"404\"",
+                "ok {{response.body.$.id}} == {{seven}}",
+                "ok {{response.body.$.id}} == \"{{other.response.body.$.id}}\"",
+                "assert {{response.body.$.name}} != \"web\": got \"web\"",
+                "ok {{response.body.$.name}} contains \"e\"",
+                "assert {{response.body.$.name}} !contains \"e\": got \"web\"",
+                "ok {{response.body.$.tags}} == [\"a\"]",
+                "ok {{response.body.$.n}} == null",
+                "ok {{response.body.$.count}} > 2.5",
+                "assert {{response.body.$.name}} > 1: not a number: \"web\"",
+                "assert {{response.body.$.missing}} == 1: response body has no value at $.missing",
+                "assert {{response.body.$.missing}} exists: response body has no value at $.missing",
+                "ok {{response.body.$.missing}} !exists",
+                "assert {{response.body.$.id}} !exists: got \"7\"",
+                "ok {{response.headers.location | split(\"/\", -1)}} == \"next\"",
+                "assert {{response.headers.Location | split(\"/\", 5)}} exists: {{response.headers.Location | split(\"/\", 5)}}: split(\"/\", 5): \"/next\" gives 2 parts",
+                "ok {{response.cookies.session}} == \"abc123\"",
+                "assert {{response.cookies.nope}} exists: response sets no cookie nope",
+            ]
+        );
+    }
+
+    #[test]
+    fn checks_see_the_loop_element() {
+        let element = serde_json::json!({"id": 7});
+        let results = run_checks(
+            concat!(
+                "### each\n",
+                "# @foreach wc in {{other.response.body.$.list}}\n",
+                "# @assert {{response.body.$.id}} == \"{{wc.id}}\"\n",
+                "# @warn {{wc}} contains \"8\"\n",
+                "GET http://a/{{wc.id}}\n",
+            ),
+            &captured(r#"{"id": 7}"#),
+            Some(&element),
+        );
+        assert_eq!(
+            results,
+            [
+                "ok {{response.body.$.id}} == \"{{wc.id}}\"",
+                "warn {{wc}} contains \"8\": got \"{\\\"id\\\":7}\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn check_references_are_dependencies() {
+        let file = parse(concat!(
+            "@v = {{login.response.body.$.v}}\n",
+            "### a\n",
+            "# @assert {{response.body.$.v}} == \"{{v}}\"\n",
+            "# @notice {{other.response.headers.X}} exists\n",
+            "GET http://a/\n",
+        ))
+        .unwrap();
+        let names: Vec<_> = file
+            .references(&file.requests[0])
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(names, ["login", "other"]);
+
+        for (check, message) in [
+            (
+                "{{nope}} exists",
+                "@assert {{nope}} exists: undefined variable: nope",
+            ),
+            (
+                "{{response.status.x}} exists",
+                "@assert {{response.status.x}} exists: invalid response reference {{response.status.x}}",
+            ),
+            (
+                "{{x | upper}} exists",
+                "@assert {{x | upper}} exists: invalid filter in {{x | upper}}",
+            ),
+        ] {
+            let file = parse(&format!("# @assert {check}\nGET http://a/\n")).unwrap();
+            let err = format!("{:#}", file.references(&file.requests[0]).err().unwrap());
+            assert!(err.starts_with(message), "{err}");
+        }
+        // `response.` only means the own response inside checks.
+        let err = resolved("GET http://a/{{response.status}}\n")
+            .err()
+            .unwrap();
+        assert_eq!(err.to_string(), "undefined variable: response.status");
+        // A file variable cannot read the checked request's own response.
+        let file =
+            parse("@s = {{response.status}}\n# @assert {{s}} == 200\nGET http://a/\n").unwrap();
+        let err = file.references(&file.requests[0]).err().unwrap();
+        assert_eq!(
+            format!("{err:#}"),
+            "@assert {{s}} == 200: undefined variable: response.status"
+        );
     }
 }
