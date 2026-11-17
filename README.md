@@ -80,14 +80,36 @@ Content-Type: application/json
 GET {{base}}/me
 Authorization: Bearer {{login.response.body.$.token}}
 X-Session: {{login.response.headers.X-Session-Id}}
+X-Csrf-Token: {{login.response.cookies.csrftoken}}
 ```
 
-- `{{NAME.response.body.$.path}}` takes a value from the JSON body; `{{NAME.response.headers.Header-Name}}` takes a header (case-insensitive, first value if repeated). They work in the URL, headers and body, and inside file variables (`@token = {{login.response.body.$.token}}`).
+- `{{NAME.response.body.$.path}}` takes a value from the JSON body; `{{NAME.response.headers.Header-Name}}` takes a header (case-insensitive, first value if repeated); `{{NAME.response.cookies.cookie_name}}` takes the value of a cookie set by a `Set-Cookie` header (name case-sensitive, attributes and surrounding quotes removed, last value if set more than once). They work in the URL, headers and body, and inside file variables (`@token = {{login.response.body.$.token}}`).
 - NAME is the referenced request's name, matched exactly as with `-n`; give a request a short name with `# @name`.
 - The path supports `$`, `.key`, `['key']` and `[N]` (0-based), e.g. `$.items[0]['id']`. A string is inserted without quotes; numbers, booleans and `null` as written; objects and arrays as compact JSON.
 - `axon-cli -f api.http -n me` runs `login` first: a referenced request that has not responded yet in this run is sent automatically, once, before the request that needs it (and its own dependencies before it). A request given with `-n` always runs, even if it already ran as a dependency.
 - The default output prints every response sent, dependencies included; `-b` and `--json` print only the `-n` requests, so `-n me -b > me.json` and `-n me --json | jq .status.code` are unaffected by `login`. Add `--with-deps` to get the whole chain as JSON: `-n me --json --with-deps` prints `[{"name": "login", "dependency": true, ...}, {"name": "me", ...}]`.
-- Unknown names, invalid references and cycles (`a` → `b` → `a`) are reported before any request is sent; a body that is not JSON, a missing path or a missing header is an error when the request is about to be sent.
+- Unknown names, invalid references and cycles (`a` → `b` → `a`) are reported before any request is sent; a body that is not JSON, a missing path, header or cookie is an error when the request is about to be sent.
+
+#### Cookies
+
+Cookies set by one request are always sent back on later requests in the same run (when domain and path match), so a session cookie needs nothing extra. To use a cookie's value somewhere else, such as a CSRF header or the body, reference it:
+
+```http
+### login
+POST {{base}}/login
+Content-Type: application/json
+
+{"user": "demo"}
+
+### update profile
+PUT {{base}}/profile
+X-CSRF-Token: {{login.response.cookies.csrftoken}}
+Content-Type: application/json
+
+{"name": "Demo", "csrf": "{{login.response.cookies.csrftoken}}"}
+```
+
+If `login` responds with `Set-Cookie: csrftoken=x7k2p9; Path=/; SameSite=Strict`, the reference is `x7k2p9`. `axon-cli -f api.http -n "update profile"` runs `login` first, sends its cookies in the `Cookie` header, and puts the token in the header and the body. Only the final response's cookies can be referenced: a cookie set on a redirect is stored and sent back, but not captured unless that request runs with `--no-follow`.
 
 ### Loops
 
@@ -108,6 +130,34 @@ X-Name: {{user.name}}
 - An empty array sends nothing.
 - The default output prints every iteration; `-b` prints each iteration's body, back to back. With `--json`, a looping `-n` takes one slot holding an array of its iterations, so `-n "list users" -n "user details"` prints `[{...}, [{...}, {...}]]` and a single looping `-n` prints just the array (`[]` when empty).
 - A request can have one `@foreach`, it must loop over a response body, and other requests cannot reference a looping request; these are reported before any request is sent. A value that is not an array, a missing `{{user...}}` value or a failed iteration stops the run with exit 1, naming the element: `request "user details" (element 2): ...`.
+
+### Filters
+
+A `{{...}}` value can be passed through filters with `|`, applied left to right, to use part of a string:
+
+```http
+### create item
+POST {{base}}/items
+# responds with  Location: /api/v2/items/42?rev=7
+
+### show item
+GET {{base}}/items/{{create item.response.headers.Location | split("/", -1) | split("?", 0)}}
+X-Revision: {{create item.response.headers.Location | split("rev=", 1)}}
+Authorization: Bearer {{login.response.body.$.auth | trim | prefix("Bearer ")}}
+```
+
+| Filter | Result | `"/api/v2/items/42?rev=7"` becomes |
+|---|---|---|
+| `split("sep", N)` | Part N after splitting on `sep`; 0-based, negative counts from the end (`-1` is the last) | `split("/", 3)` → `items`, `split("/", -1)` → `42?rev=7` |
+| `trim` | Leading and trailing whitespace removed | unchanged |
+| `prefix("x")` | The text after `x`, which must be at the start | `prefix("/api/")` → `v2/items/42?rev=7` |
+| `suffix("x")` | The text before `x`, which must be at the end | `suffix("?rev=7")` → `/api/v2/items/42` |
+
+- Filters work on any value: file and environment variables, response references (body, header, cookie) and loop variables. In a file variable they apply when it is used: `@item_id = {{create item.response.headers.Location | split("/", -1)}}`.
+- A JSON value that is not a string is filtered as its compact JSON text.
+- Arguments are double-quoted strings, with `\"` and `\\` as the only escapes, and integers. A `|` inside quotes is not a filter separator, but `}}` cannot appear inside an argument.
+- Unknown filters and wrong arguments are reported before any request is sent. A split index out of range or a missing prefix/suffix is an error when the request is about to be sent, naming the value: `{{... | split("/", 9)}}: split("/", 9): "/api/v2/items/42?rev=7" gives 5 parts`.
+- `@foreach` cannot use filters, since it needs an array.
 
 ### Examples
 
@@ -136,6 +186,13 @@ axon-cli -f api.http -n me -b | jq .
 
 # Same, but include the login response too (marked "dependency": true)
 axon-cli -f api.http -n me --json --with-deps | jq -r '.[] | "\(.name) \(.status.code)"'
+
+# Use a cookie from the login response; login runs first, and its cookies
+# are also sent back automatically in the Cookie header
+axon-cli -f api.http -n "update profile" -b | jq .
+
+# Use the id from the Location header of "create item", which runs first
+axon-cli -f api.http -n "show item" -b | jq .
 
 # Fetch details for every user, collect the names
 axon-cli -f api.http -n "user details" --json | jq -r '.[].body | fromjson | .name'
