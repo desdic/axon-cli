@@ -1,0 +1,29 @@
+# Imports: shared variables and requests from another file.
+#
+#   axon-cli -f examples/imports.http -l                # lists "uuid" (imported) and the requests below
+#   axon-cli -f examples/imports.http                   # each request with the "file" it is written in
+#   axon-cli -f examples/imports.http -n item           # runs the imported "uuid" first
+#   axon-cli -f examples/imports.http -n uuid           # imported requests can be run directly
+#
+# `import PATH` lines go at the top, before the first request. PATH is
+# relative to this file. Everything in shared/common.http (and the
+# shared/headers.http it imports) is inserted where the import line is.
+
+import shared/common.http
+
+# Overrides: a variable defined after the import replaces the imported one
+# everywhere, also inside imported variables, so @api from common.http is
+# now https://httpbin.org/anything/v2.
+@version = v2
+
+### item
+# {{api}} comes from common.http (with @version from this file), and
+# {{uuid.response...}} makes the imported "uuid" run first.
+GET {{api}}/items/{{uuid.response.body.$.uuid}}
+Accept: {{accept}}
+User-Agent: {{agent}}
+
+### item again
+# The imported request runs once per invocation, however many requests use it:
+#   axon-cli -f examples/imports.http -n item -n "item again"
+GET {{api}}/items/{{uuid.response.body.$.uuid}}/again

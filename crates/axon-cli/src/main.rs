@@ -99,10 +99,7 @@ fn main() -> ExitCode {
 /// summary such as `2 checks failed, 1 request skipped`.
 fn run(args: Args) -> Result<(Output, Option<String>)> {
     let path = &args.file;
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let file = httpfile::parse(&contents)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let file = httpfile::parse_file(path)?;
 
     if args.list {
         // An unnamed request is listed as the `#N` that selects it with -n.
@@ -127,6 +124,7 @@ fn run(args: Args) -> Result<(Output, Option<String>)> {
                         json!({
                             "index": index,
                             "name": r.name,
+                            "file": r.file,
                             "method": r.method,
                             "url": r.url,
                             "start_line": r.start_line,

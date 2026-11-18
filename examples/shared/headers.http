@@ -1,0 +1,5 @@
+# Imported by common.http: imports can be nested. A file with only
+# variables is a valid import.
+
+@accept = application/json
+@agent = axon-cli-example
