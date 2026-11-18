@@ -26,10 +26,15 @@ pub struct Request {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Option<String>,
-    /// Set by `# @foreach VAR in {{...}}`: the request runs once per element.
-    pub foreach: Option<Foreach>,
+    /// Set by `# @foreach VAR in {{...}}` lines: the request runs once per
+    /// element, nested in the order written.
+    pub foreach: Vec<Foreach>,
     /// `# @assert`, `# @warn` and `# @notice` checks, in the order written.
     pub checks: Vec<Check>,
+    /// `# @skip-if` conditions: an iteration is not sent when one is true.
+    pub skips: Vec<Check>,
+    /// `# @let NAME = VALUE` request-local variables, in the order written.
+    pub lets: Vec<Let>,
     /// 1-based lines of the request's block: from its `###` separator (or the
     /// start of the file) up to the line before the next separator.
     pub start_line: usize,
@@ -84,6 +89,8 @@ impl Level {
 enum Op {
     Eq,
     Ne,
+    In,
+    NotIn,
     Contains,
     NotContains,
     Lt,
@@ -102,14 +109,16 @@ pub struct Check {
     /// Written as `@fail-if`, `@warn-if` or `@notice-if`: reported when the
     /// comparison is true rather than false.
     pub inverted: bool,
+    /// The directive keyword, without `@`: `assert`, `warn-if`, `skip-if`…
+    keyword: &'static str,
     /// The check as written after the keyword, for messages.
     pub text: String,
     /// One `{{...}}`, as written; `status` is `{{response.status}}`.
     subject: String,
     op: Op,
-    /// Text to substitute and compare with, its quotes removed; `None` for
-    /// `exists` and `!exists`.
-    expected: Option<String>,
+    /// Texts to substitute and compare with, their quotes removed: none for
+    /// `exists` and `!exists`, one or more for `in` and `!in`, else one.
+    expected: Vec<String>,
 }
 
 /// The outcome of one check against one response.
@@ -166,17 +175,101 @@ enum Arg {
     Int(i64),
 }
 
-/// A `# @foreach VAR in {{NAME.response.body.$.path}}` directive.
+/// A `# @let NAME = VALUE` request-local variable.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Let {
+    pub name: String,
+    /// Substituted for each iteration.
+    pub value: String,
+}
+
+/// A `# @foreach VAR in {{SOURCE}}` directive.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Foreach {
     /// The loop variable, used as `{{VAR}}`, `{{VAR.key}}`, `{{VAR[N]}}`.
     pub var: String,
-    /// The array to loop over (always a body reference).
-    pub source: Reference,
+    /// The array to loop over.
+    source: Source,
 }
 
-/// The loop variable in scope while substituting a looping request, with the
-/// current element (`None` when only checking).
+/// What a `@foreach` loops over.
+#[derive(Clone, Debug, PartialEq)]
+enum Source {
+    /// A response body reference, `{{NAME.response.body.$.path}}`.
+    Response(Reference),
+    /// A value inside an earlier loop variable, `{{VAR.path}}`.
+    Var {
+        /// As written, for messages.
+        text: String,
+        var: String,
+        steps: Vec<Step>,
+    },
+}
+
+impl Source {
+    /// The source as written, for messages.
+    fn text(&self) -> String {
+        match self {
+            Source::Response(reference) => reference.text(),
+            Source::Var { text, .. } => text.clone(),
+        }
+    }
+}
+
+/// A loop variable's element in one iteration, with its 0-based index.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Binding {
+    pub var: String,
+    pub index: usize,
+    pub value: Value,
+}
+
+/// What one iteration of a request (or the one run of a request that does
+/// not loop) can read.
+#[derive(Clone, Copy)]
+pub struct Iteration<'a> {
+    /// Responses by request name.
+    pub responses: &'a HashMap<String, Captured>,
+    /// The looping request being followed, with its response in this
+    /// iteration; it wins over `responses`.
+    pub followed: Option<(&'a str, &'a Captured)>,
+    /// Loop variables, outermost first.
+    pub vars: &'a [Binding],
+}
+
+impl<'a> Iteration<'a> {
+    fn response(&self, name: &str) -> Result<&'a Captured> {
+        if let Some((followed, response)) = self.followed
+            && followed == name
+        {
+            return Ok(response);
+        }
+        self.responses
+            .get(name)
+            .with_context(|| format!("no response from \"{name}\" yet"))
+    }
+
+    fn items(&self) -> Vec<Item<'a>> {
+        self.vars
+            .iter()
+            .map(|binding| Item {
+                var: &binding.var,
+                element: Some(&binding.value),
+            })
+            .collect()
+    }
+}
+
+/// Why expanding a request's `@foreach` lines failed, with the loop
+/// variables of the iteration being expanded.
+#[derive(Debug)]
+pub struct IterationError {
+    pub vars: Vec<Binding>,
+    pub error: anyhow::Error,
+}
+
+/// A loop variable in scope while substituting, with its current element
+/// (`None` when only checking).
 #[derive(Clone, Copy)]
 struct Item<'a> {
     var: &'a str,
@@ -187,11 +280,25 @@ struct Item<'a> {
 /// requests' responses.
 #[derive(Clone, Copy, Default)]
 struct Scope<'a> {
-    /// The loop variable of a looping request.
-    item: Option<Item<'a>>,
+    /// Loop variables, outermost first.
+    items: &'a [Item<'a>],
     /// In a check, the request's own response, read by `{{response...}}`
     /// (`Some(None)` when only checking).
     own: Option<Option<&'a Captured>>,
+    /// While collecting references before the loop variables in scope are
+    /// known, an undefined variable is unknown rather than an error.
+    lenient: bool,
+    /// The request's `@let` variables evaluated so far (`None` values when
+    /// only checking).
+    lets: &'a [(String, Option<String>)],
+}
+
+/// Letters, digits, `_` and `-`.
+fn is_var_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// The parts of a received response that references can read.
@@ -352,7 +459,8 @@ fn json_text(value: &Value) -> String {
     }
 }
 
-/// Parses the text after `@foreach`: `VAR in {{NAME.response.body.$.path}}`.
+/// Parses the text after `@foreach`: `VAR in {{NAME.response.body.$.path}}`
+/// or `VAR in {{VAR.path}}`.
 fn parse_foreach(text: &str) -> Result<Foreach> {
     let invalid = || {
         anyhow::anyhow!(
@@ -368,33 +476,46 @@ fn parse_foreach(text: &str) -> Result<Foreach> {
         .and_then(|r| r.strip_suffix("}}"))
         .ok_or_else(invalid)?
         .trim();
-    if !var
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
+    if !is_var_name(var) {
         bail!("invalid @foreach variable (use letters, digits, _ and -): {var}");
     }
     if split_pipes(source).len() > 1 {
         bail!("@foreach cannot use filters: {{{{{source}}}}}");
     }
-    let Some(source) = Reference::parse(source) else {
-        bail!(
-            "@foreach must loop over a {{{{NAME.response.body.$.path}}}} reference: {{{{{source}}}}}"
-        );
+    let source = match Reference::parse(source) {
+        Some(reference) => {
+            let reference = reference?;
+            let kind = match reference.part {
+                Part::Body { .. } => None,
+                Part::Header(_) => Some("header"),
+                Part::Cookie(_) => Some("cookie"),
+                Part::Status => Some("status"),
+            };
+            if let Some(kind) = kind {
+                bail!(
+                    "@foreach must loop over a response body, not a {kind}: {{{{{}}}}}",
+                    reference.text()
+                );
+            }
+            Source::Response(reference)
+        }
+        None => {
+            let end = source.find(['.', '[']).unwrap_or(source.len());
+            let source_var = &source[..end];
+            if !is_var_name(source_var) {
+                bail!(
+                    "@foreach must loop over a {{{{NAME.response.body.$.path}}}} reference or a loop variable: {{{{{source}}}}}"
+                );
+            }
+            let steps = parse_path(&format!("${}", &source[end..]))
+                .with_context(|| format!("invalid loop variable reference {{{{{source}}}}}"))?;
+            Source::Var {
+                text: source.to_string(),
+                var: source_var.to_string(),
+                steps,
+            }
+        }
     };
-    let source = source?;
-    let kind = match source.part {
-        Part::Body { .. } => None,
-        Part::Header(_) => Some("header"),
-        Part::Cookie(_) => Some("cookie"),
-        Part::Status => Some("status"),
-    };
-    if let Some(kind) = kind {
-        bail!(
-            "@foreach must loop over a response body, not a {kind}: {{{{{}}}}}",
-            source.text()
-        );
-    }
     Ok(Foreach {
         var: var.to_string(),
         source,
@@ -556,8 +677,7 @@ fn parse_quoted(after: &str) -> Result<(String, &str)> {
 
 /// Parses the text after `@assert`, `@warn`, `@notice` or their `-if` forms:
 /// `SUBJECT OPERATOR [EXPECTED]`.
-fn parse_check(level: Level, inverted: bool, text: &str) -> Result<Check> {
-    let keyword = directive_keyword(level, inverted);
+fn parse_check(keyword: &'static str, level: Level, inverted: bool, text: &str) -> Result<Check> {
     let invalid = |why: String| anyhow::anyhow!("invalid @{keyword} ({why}): @{keyword} {text}");
     let (subject, rest) = if let Some(after) = text.strip_prefix("{{") {
         let end = after
@@ -579,6 +699,8 @@ fn parse_check(level: Level, inverted: bool, text: &str) -> Result<Check> {
     let op = match op_text {
         "==" => Op::Eq,
         "!=" => Op::Ne,
+        "in" => Op::In,
+        "!in" => Op::NotIn,
         "contains" => Op::Contains,
         "!contains" => Op::NotContains,
         "<" => Op::Lt,
@@ -590,7 +712,7 @@ fn parse_check(level: Level, inverted: bool, text: &str) -> Result<Check> {
         "" => return Err(invalid("missing operator".to_string())),
         other => {
             return Err(invalid(format!(
-                "unknown operator \"{other}\"; expected ==, !=, contains, !contains, <, <=, >, >=, exists or !exists"
+                "unknown operator \"{other}\"; expected ==, !=, in, !in, contains, !contains, <, <=, >, >=, exists or !exists"
             )));
         }
     };
@@ -598,31 +720,81 @@ fn parse_check(level: Level, inverted: bool, text: &str) -> Result<Check> {
         matches!(op, Op::Exists | Op::NotExists),
         expected.is_empty(),
     ) {
-        (true, true) => None,
+        (true, true) => Vec::new(),
         (true, false) => return Err(invalid(format!("{op_text} takes no value"))),
         (false, true) => return Err(invalid(format!("{op_text} needs a value"))),
-        (false, false) => Some(match expected.strip_prefix('"') {
-            Some(after) => {
-                let (value, rest) = parse_quoted(after).map_err(|e| invalid(e.to_string()))?;
-                if !rest.trim().is_empty() {
-                    return Err(invalid(format!(
-                        "unexpected text after the closing quote: {}",
-                        rest.trim()
-                    )));
+        (false, false) if matches!(op, Op::In | Op::NotIn) => {
+            let mut values = Vec::new();
+            for item in split_list(expected) {
+                if item.is_empty() {
+                    return Err(invalid(format!("{op_text} has an empty value")));
                 }
-                value
+                values.push(expected_value(item).map_err(|e| invalid(e.to_string()))?);
             }
-            None => expected.to_string(),
-        }),
+            values
+        }
+        (false, false) => vec![expected_value(expected).map_err(|e| invalid(e.to_string()))?],
     };
     Ok(Check {
         level,
         inverted,
+        keyword,
         text: text.to_string(),
         subject,
         op,
         expected,
     })
+}
+
+/// An EXPECTED value: a double-quoted string, its quotes and escapes
+/// removed, or bare text.
+fn expected_value(text: &str) -> Result<String> {
+    let Some(after) = text.strip_prefix('"') else {
+        return Ok(text.to_string());
+    };
+    let (value, rest) = parse_quoted(after)?;
+    if !rest.trim().is_empty() {
+        bail!("unexpected text after the closing quote: {}", rest.trim());
+    }
+    Ok(value)
+}
+
+/// Splits an `in` list on commas outside double quotes and `{{...}}`,
+/// trimming each item.
+fn split_list(text: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut start = 0;
+    let mut depth = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                quoted = false;
+            }
+        } else if c == b'"' {
+            quoted = true;
+        } else if text[i..].starts_with("{{") {
+            depth += 1;
+            i += 1;
+        } else if depth > 0 && text[i..].starts_with("}}") {
+            depth -= 1;
+            i += 1;
+        } else if c == b',' && depth == 0 {
+            items.push(text[start..i].trim());
+            start = i + 1;
+        }
+        i += 1;
+    }
+    items.push(text[start..].trim());
+    items
 }
 
 /// `assert`, or `fail-if` for an inverted check.
@@ -637,7 +809,26 @@ fn directive_keyword(level: Level, inverted: bool) -> &'static str {
 impl Check {
     /// The directive as written, with `@`.
     pub fn directive(&self) -> String {
-        format!("@{}", directive_keyword(self.level, self.inverted))
+        format!("@{}", self.keyword)
+    }
+
+    /// Whether the comparison is true; an unreadable value is an error,
+    /// except for `exists` and `!exists`.
+    fn holds(&self, eval: &mut dyn FnMut(&str) -> Result<String>) -> Result<bool> {
+        let subject = eval(&self.subject);
+        match self.op {
+            Op::Exists => Ok(subject.is_ok()),
+            Op::NotExists => Ok(subject.is_err()),
+            _ => {
+                let actual = subject?;
+                self.compare(&actual, eval)
+            }
+        }
+    }
+
+    /// The `{{...}}` texts it substitutes.
+    fn texts(&self) -> impl Iterator<Item = &String> {
+        std::iter::once(&self.subject).chain(&self.expected)
     }
 
     /// Compares the subject with the expected value; `eval` substitutes a
@@ -665,12 +856,20 @@ impl Check {
 
     /// Whether the comparison of `actual` with the expected value is true.
     fn compare(&self, actual: &str, eval: &mut dyn FnMut(&str) -> Result<String>) -> Result<bool> {
-        let expected = eval(self.expected.as_deref().unwrap_or_default())?;
+        if matches!(self.op, Op::In | Op::NotIn) {
+            let mut found = false;
+            for expected in &self.expected {
+                found |= eval(expected)? == actual;
+            }
+            return Ok(found == (self.op == Op::In));
+        }
+        let expected = eval(self.expected.first().map_or("", String::as_str))?;
         Ok(match self.op {
             Op::Eq => actual == expected,
             Op::Ne => actual != expected,
             Op::Contains => actual.contains(&expected),
             Op::NotContains => !actual.contains(&expected),
+            Op::In | Op::NotIn | Op::Exists | Op::NotExists => unreachable!("handled above"),
             op => {
                 let (a, e) = (number(actual)?, number(&expected)?);
                 match op {
@@ -768,8 +967,10 @@ impl HttpFile {
         lines: &[(usize, &str)],
     ) -> Result<()> {
         let mut lines = lines.iter();
-        let mut foreach = None;
+        let mut foreach: Vec<Foreach> = Vec::new();
         let mut checks = Vec::new();
+        let mut lets = Vec::new();
+        let mut skips = Vec::new();
 
         // Variables, comments, `# @name`, `# @foreach` and checks, up to the
         // request line.
@@ -783,11 +984,26 @@ impl HttpFile {
             }
             if let Some(directive) = foreach_directive(line) {
                 let directive = directive.with_context(|| format!("line {line_no}"))?;
-                if foreach.replace(directive).is_some() {
-                    bail!("line {line_no}: more than one @foreach in a request");
+                if foreach.iter().any(|f| f.var == directive.var) {
+                    bail!(
+                        "line {line_no}: @foreach variable \"{}\" is used twice",
+                        directive.var
+                    );
                 }
+                foreach.push(directive);
             } else if let Some((_, check)) = check_directive(line) {
                 checks.push(check.with_context(|| format!("line {line_no}"))?);
+            } else if let Some(skip) = skip_directive(line) {
+                skips.push(skip.with_context(|| format!("line {line_no}"))?);
+            } else if let Some(directive) = let_directive(line) {
+                let directive = directive.with_context(|| format!("line {line_no}"))?;
+                if lets.iter().any(|l: &Let| l.name == directive.name) {
+                    bail!(
+                        "line {line_no}: @let variable \"{}\" is defined twice",
+                        directive.name
+                    );
+                }
+                lets.push(directive);
             } else if let Some(directive) = name_directive(line) {
                 name = Some(directive);
             } else if is_comment(line) {
@@ -827,6 +1043,10 @@ impl HttpFile {
             let line = line.trim();
             if line.is_empty() {
                 in_body = true;
+            } else if let_directive(line).is_some() {
+                bail!("line {line_no}: @let must come before the request line");
+            } else if skip_directive(line).is_some() {
+                bail!("line {line_no}: @skip-if must come before the request line");
             } else if let Some((keyword, _)) = check_directive(line) {
                 bail!(
                     "line {line_no}: @{} must come before the request line",
@@ -851,108 +1071,302 @@ impl HttpFile {
             body: (!body.is_empty()).then(|| body.join("\n")),
             foreach,
             checks,
+            skips,
+            lets,
             start_line,
             end_line,
         });
         Ok(())
     }
 
-    /// Substitutes variables in the request's URL, headers and body, taking
-    /// response references from `responses` (keyed by request name) and, for
-    /// a looping request, the loop variable from `element`.
-    pub fn resolve(
+    /// Substitutes variables in the request's URL, headers and body for one
+    /// iteration (or the one run of a request that does not loop).
+    pub fn resolve(&self, request: &Request, ctx: &Iteration) -> Result<Request> {
+        let items = ctx.items();
+        let scope = Scope {
+            items: &items,
+            ..Scope::default()
+        };
+        let mut on_reference = |reference: &Reference| -> Result<Option<String>> {
+            reference.extract(ctx.response(&reference.name)?).map(Some)
+        };
+        let lets = self.let_values(request, scope, &mut on_reference)?;
+        self.substitute_request(
+            request,
+            Scope {
+                lets: &lets,
+                ..scope
+            },
+            &mut on_reference,
+        )
+    }
+
+    /// Whether one of the request's `@skip-if` conditions is true in this
+    /// iteration, so it is not sent.
+    pub fn skip(&self, request: &Request, ctx: &Iteration) -> Result<bool> {
+        if request.skips.is_empty() {
+            return Ok(false);
+        }
+        let items = ctx.items();
+        let scope = Scope {
+            items: &items,
+            ..Scope::default()
+        };
+        let mut on_reference = |reference: &Reference| -> Result<Option<String>> {
+            reference.extract(ctx.response(&reference.name)?).map(Some)
+        };
+        let lets = self.let_values(request, scope, &mut on_reference)?;
+        let scope = Scope {
+            lets: &lets,
+            ..scope
+        };
+        for skip in &request.skips {
+            let mut eval = |text: &str| {
+                self.substitute(text, self.variables.len(), scope, &mut on_reference)
+                    .map(Option::unwrap_or_default)
+            };
+            if skip
+                .holds(&mut eval)
+                .with_context(|| format!("{} {}", skip.directive(), skip.text))?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The request's `@let` variables, in order, each seeing the earlier ones.
+    fn let_values(
         &self,
         request: &Request,
-        responses: &HashMap<String, Captured>,
-        element: Option<&Value>,
-    ) -> Result<Request> {
-        let item = match (&request.foreach, element) {
-            (Some(foreach), Some(element)) => Some(Item {
-                var: &foreach.var,
-                element: Some(element),
-            }),
-            (None, None) => None,
-            (Some(_), None) => bail!("a looping request needs an element to resolve"),
-            (None, Some(_)) => bail!("only a looping request takes an element"),
-        };
-        self.substitute_request(request, item, &mut |reference| {
-            let response = responses
-                .get(&reference.name)
-                .with_context(|| format!("no response from \"{}\" yet", reference.name))?;
-            reference.extract(response).map(Some)
-        })
+        scope: Scope,
+        on_reference: OnReference,
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let mut values = Vec::new();
+        for each in &request.lets {
+            let value = self
+                .substitute(
+                    &each.value,
+                    self.variables.len(),
+                    Scope {
+                        lets: &values,
+                        ..scope
+                    },
+                    on_reference,
+                )
+                .with_context(|| format!("@let {}", each.name))?;
+            values.push((each.name.clone(), value));
+        }
+        Ok(values)
+    }
+
+    /// The names of the requests this request references, in order of
+    /// appearance (`@foreach` sources first). Unlike [`HttpFile::references`]
+    /// it does not need to know the loop variables in scope, which may come
+    /// from a looping request it follows.
+    pub fn referenced_names(&self, request: &Request) -> Result<Vec<String>> {
+        let mut names: Vec<String> = Vec::new();
+        for reference in self.collect_references(request, &[], true)? {
+            if !names.contains(&reference.name) {
+                names.push(reference.name);
+            }
+        }
+        Ok(names)
     }
 
     /// The distinct response references in the request, including those
-    /// reached through file variables and a `@foreach` source (first), in
+    /// reached through file variables and `@foreach` sources (first), in
     /// order of appearance. Also checks the request's variables, like
-    /// [`HttpFile::resolve`].
-    pub fn references(&self, request: &Request) -> Result<Vec<Reference>> {
-        let mut found: Vec<Reference> = Vec::new();
-        let mut item = None;
-        if let Some(foreach) = &request.foreach {
-            if self.variables.iter().any(|(name, _)| *name == foreach.var) {
+    /// [`HttpFile::resolve`]; `inherited` are the loop variables of the
+    /// looping request it follows, if any.
+    pub fn references(&self, request: &Request, inherited: &[String]) -> Result<Vec<Reference>> {
+        let mut known: Vec<&str> = inherited.iter().map(String::as_str).collect();
+        for foreach in &request.foreach {
+            let var = foreach.var.as_str();
+            if self.variables.iter().any(|(name, _)| name == var) {
+                bail!("@foreach variable \"{var}\" has the same name as a file variable");
+            }
+            if known.contains(&var) {
+                bail!("@foreach variable \"{var}\" is already a loop variable");
+            }
+            if let Source::Var {
+                text,
+                var: source_var,
+                ..
+            } = &foreach.source
+                && !known.contains(&source_var.as_str())
+            {
                 bail!(
-                    "@foreach variable \"{}\" has the same name as a file variable",
-                    foreach.var
+                    "@foreach must loop over a {{{{NAME.response.body.$.path}}}} reference or an earlier loop variable: {{{{{text}}}}}"
                 );
             }
-            found.push(foreach.source.clone());
-            item = Some(Item {
-                var: &foreach.var,
-                element: None,
-            });
+            known.push(var);
         }
+        for skip in &request.skips {
+            if request.foreach.is_empty() && inherited.is_empty() {
+                bail!("@skip-if is only for a looping request (@foreach)");
+            }
+            if skip.texts().any(|text| uses_own_response(text)) {
+                bail!(
+                    "@skip-if {}: cannot read {{{{response...}}}}, since nothing has been sent yet",
+                    skip.text
+                );
+            }
+        }
+        for each in &request.lets {
+            let name = each.name.as_str();
+            if self.variables.iter().any(|(var, _)| var == name) {
+                bail!("@let variable \"{name}\" has the same name as a file variable");
+            }
+            if known.contains(&name) {
+                bail!("@let variable \"{name}\" has the same name as a loop variable");
+            }
+        }
+        self.collect_references(request, &known, false)
+    }
+
+    /// The distinct response references in the request, with `vars` the
+    /// loop variables in scope; `lenient` leaves undefined variables unknown.
+    fn collect_references(
+        &self,
+        request: &Request,
+        vars: &[&str],
+        lenient: bool,
+    ) -> Result<Vec<Reference>> {
+        let mut found: Vec<Reference> = Vec::new();
+        for foreach in &request.foreach {
+            if let Source::Response(reference) = &foreach.source
+                && !found.contains(reference)
+            {
+                found.push(reference.clone());
+            }
+        }
+        let items: Vec<Item> = vars
+            .iter()
+            .map(|&var| Item { var, element: None })
+            .collect();
+        let scope = Scope {
+            items: &items,
+            lenient,
+            ..Scope::default()
+        };
         let mut collect = |reference: &Reference| -> Result<Option<String>> {
             if !found.contains(reference) {
                 found.push(reference.clone());
             }
             Ok(None)
         };
-        self.substitute_request(request, item, &mut collect)?;
+        let lets = self.let_values(request, scope, &mut collect)?;
+        let scope = Scope {
+            lets: &lets,
+            ..scope
+        };
+        self.substitute_request(request, scope, &mut collect)?;
         // A check's `{{response...}}` is its own response, not a dependency.
         let scope = Scope {
-            item,
             own: Some(None),
+            ..scope
         };
         for check in &request.checks {
-            for text in [Some(&check.subject), check.expected.as_ref()]
-                .into_iter()
-                .flatten()
-            {
+            for text in check.texts() {
                 self.substitute(text, self.variables.len(), scope, &mut collect)
                     .with_context(|| format!("{} {}", check.directive(), check.text))?;
+            }
+        }
+        // Nothing has been sent when a @skip-if is evaluated.
+        let scope = Scope { own: None, ..scope };
+        for skip in &request.skips {
+            for text in skip.texts() {
+                self.substitute(text, self.variables.len(), scope, &mut collect)
+                    .with_context(|| format!("{} {}", skip.directive(), skip.text))?;
             }
         }
         Ok(found)
     }
 
+    /// The loop variables of each iteration of the request's own `@foreach`
+    /// lines, nested in the order written, to add after those in `ctx`; one
+    /// empty list for a request without `@foreach`.
+    pub fn iterations(
+        &self,
+        request: &Request,
+        ctx: &Iteration,
+    ) -> std::result::Result<Vec<Vec<Binding>>, IterationError> {
+        let mut combinations = vec![Vec::new()];
+        for foreach in &request.foreach {
+            let mut next = Vec::new();
+            for vars in combinations {
+                let items = match self.source_value(&foreach.source, ctx, &vars) {
+                    Ok(Value::Array(items)) => items,
+                    Ok(_) => {
+                        let error = anyhow::anyhow!(
+                            "@foreach: {{{{{}}}}} is not an array",
+                            foreach.source.text()
+                        );
+                        return Err(IterationError { vars, error });
+                    }
+                    Err(error) => return Err(IterationError { vars, error }),
+                };
+                for (index, value) in items.into_iter().enumerate() {
+                    let mut inner = vars.clone();
+                    inner.push(Binding {
+                        var: foreach.var.clone(),
+                        index,
+                        value,
+                    });
+                    next.push(inner);
+                }
+            }
+            combinations = next;
+        }
+        Ok(combinations)
+    }
+
+    /// The value a `@foreach` loops over, with `own` the request's own loop
+    /// variables bound so far.
+    fn source_value(&self, source: &Source, ctx: &Iteration, own: &[Binding]) -> Result<Value> {
+        match source {
+            Source::Response(reference) => reference.value(ctx.response(&reference.name)?),
+            Source::Var { text, var, steps } => {
+                let binding = own
+                    .iter()
+                    .rev()
+                    .chain(ctx.vars.iter().rev())
+                    .find(|binding| binding.var == *var)
+                    .with_context(|| format!("undefined loop variable: {var}"))?;
+                walk(&binding.value, steps)
+                    .cloned()
+                    .with_context(|| format!("current element has no value at {{{{{text}}}}}"))
+            }
+        }
+    }
+
     /// Evaluates the request's checks against `response`, its own response,
-    /// with other requests' responses from `responses` and, for a looping
-    /// request, the loop variable from `element`.
+    /// in the iteration described by `ctx`.
     pub fn check(
         &self,
         request: &Request,
         response: &Captured,
-        responses: &HashMap<String, Captured>,
-        element: Option<&Value>,
+        ctx: &Iteration,
     ) -> Vec<CheckResult> {
-        let scope = Scope {
-            item: request
-                .foreach
-                .as_ref()
-                .zip(element)
-                .map(|(foreach, element)| Item {
-                    var: &foreach.var,
-                    element: Some(element),
-                }),
-            own: Some(Some(response)),
-        };
+        let items = ctx.items();
         let mut on_reference = |reference: &Reference| -> Result<Option<String>> {
-            let response = responses
-                .get(&reference.name)
-                .with_context(|| format!("no response from \"{}\" yet", reference.name))?;
-            reference.extract(response).map(Some)
+            reference.extract(ctx.response(&reference.name)?).map(Some)
+        };
+        let scope = Scope {
+            items: &items,
+            ..Scope::default()
+        };
+        // `@let` values do not see the response, so they are as when sent.
+        let lets = self.let_values(request, scope, &mut on_reference);
+        let (lets, lets_error) = match lets {
+            Ok(lets) => (lets, None),
+            Err(err) => (Vec::new(), Some(format!("{err:#}"))),
+        };
+        let scope = Scope {
+            own: Some(Some(response)),
+            lets: &lets,
+            ..scope
         };
         request
             .checks
@@ -966,40 +1380,22 @@ impl HttpFile {
                     level: check.level,
                     inverted: check.inverted,
                     text: check.text.clone(),
-                    error: check.evaluate(&mut eval).err().map(|e| format!("{e:#}")),
+                    error: match &lets_error {
+                        Some(error) => Some(error.clone()),
+                        None => check.evaluate(&mut eval).err().map(|e| format!("{e:#}")),
+                    },
                 }
             })
             .collect()
     }
 
-    /// For a looping request, the elements of its `@foreach` array, read from
-    /// `responses`; `None` for a request that does not loop.
-    pub fn loop_items(
-        &self,
-        request: &Request,
-        responses: &HashMap<String, Captured>,
-    ) -> Result<Option<Vec<Value>>> {
-        let Some(foreach) = &request.foreach else {
-            return Ok(None);
-        };
-        let source = &foreach.source;
-        let response = responses
-            .get(&source.name)
-            .with_context(|| format!("no response from \"{}\" yet", source.name))?;
-        match source.value(response)? {
-            Value::Array(items) => Ok(Some(items)),
-            _ => bail!("@foreach: {{{{{}}}}} is not an array", source.text()),
-        }
-    }
-
     fn substitute_request(
         &self,
         request: &Request,
-        item: Option<Item>,
+        scope: Scope,
         on_reference: OnReference,
     ) -> Result<Request> {
         let all = self.variables.len();
-        let scope = Scope { item, own: None };
         // While only checking, unknown values are left empty.
         let mut substitute = |text| {
             Ok::<_, anyhow::Error>(
@@ -1024,6 +1420,8 @@ impl HttpFile {
             body,
             foreach: request.foreach.clone(),
             checks: request.checks.clone(),
+            skips: request.skips.clone(),
+            lets: request.lets.clone(),
             start_line: request.start_line,
             end_line: request.end_line,
         })
@@ -1116,8 +1514,10 @@ impl HttpFile {
         }
         // The loop variable shadows requests with the same name.
         if let Some((item, path)) = scope
-            .item
-            .and_then(|item| Some((item, loop_path(name, item.var)?)))
+            .items
+            .iter()
+            .rev()
+            .find_map(|item| Some((item, loop_path(name, item.var)?)))
         {
             let steps = parse_path(&format!("${path}"))
                 .with_context(|| format!("invalid loop variable reference {{{{{name}}}}}"))?;
@@ -1128,14 +1528,22 @@ impl HttpFile {
                 .map(|value| Some(json_text(value)))
                 .with_context(|| format!("current element has no value at {{{{{name}}}}}"));
         }
+        if let Some((_, value)) = scope.lets.iter().rev().find(|(n, _)| n == name) {
+            return Ok(value.clone());
+        }
         if let Some(reference) = Reference::parse(name) {
             return on_reference(&reference?);
         }
         // A redefined variable takes its latest earlier definition.
-        let index = self.variables[..visible]
+        let Some(index) = self.variables[..visible]
             .iter()
             .rposition(|(n, _)| n == name)
-            .with_context(|| format!("undefined variable: {name}"))?;
+        else {
+            if scope.lenient {
+                return Ok(None);
+            }
+            bail!("undefined variable: {name}");
+        };
         // The loop variable and a check's own response are not visible
         // inside file variables.
         self.substitute(
@@ -1209,8 +1617,51 @@ fn check_directive(line: &str) -> Option<(&'static str, Result<Check>)> {
             if !text.is_empty() && !text.starts_with(char::is_whitespace) {
                 return None;
             }
-            Some((keyword, parse_check(level, inverted, text.trim())))
+            Some((keyword, parse_check(keyword, level, inverted, text.trim())))
         })
+}
+
+/// The parsed `# @skip-if CHECK` or `// @skip-if ...` line, or `None` when
+/// the line is not a `@skip-if` directive.
+fn skip_directive(line: &str) -> Option<Result<Check>> {
+    let rest = line.strip_prefix('#').or_else(|| line.strip_prefix("//"))?;
+    let rest = rest.trim_start().strip_prefix("@skip-if")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some(parse_check("skip-if", Level::Notice, true, rest.trim()))
+}
+
+/// Whether a `{{...}}` in `text` reads `response...`, the checked request's
+/// own response.
+fn uses_own_response(text: &str) -> bool {
+    text.split("{{")
+        .skip(1)
+        .any(|part| part.trim_start().starts_with("response."))
+}
+
+/// The parsed `# @let NAME = VALUE` or `// @let ...` line, or `None` when
+/// the line is not a `@let` directive.
+fn let_directive(line: &str) -> Option<Result<Let>> {
+    let rest = line.strip_prefix('#').or_else(|| line.strip_prefix("//"))?;
+    let rest = rest.trim_start().strip_prefix("@let")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let text = rest.trim();
+    Some(match text.split_once('=') {
+        Some((name, value)) if is_var_name(name.trim()) => Ok(Let {
+            name: name.trim().to_string(),
+            value: value.trim().to_string(),
+        }),
+        Some((name, _)) => Err(anyhow::anyhow!(
+            "invalid @let variable (use letters, digits, _ and -): {}",
+            name.trim()
+        )),
+        None => Err(anyhow::anyhow!(
+            "invalid @let (expected \"@let NAME = VALUE\"): @let {text}"
+        )),
+    })
 }
 
 /// The name from a `# @name NAME` or `// @name NAME` line.
@@ -1249,8 +1700,10 @@ mod tests {
             url: url.into(),
             headers: Vec::new(),
             body: None,
-            foreach: None,
+            foreach: Vec::new(),
             checks: Vec::new(),
+            skips: Vec::new(),
+            lets: Vec::new(),
             start_line,
             end_line,
         }
@@ -1258,7 +1711,25 @@ mod tests {
 
     fn resolved(contents: &str) -> Result<Request> {
         let file = parse(contents).unwrap();
-        file.resolve(&file.requests[0], &HashMap::new(), None)
+        file.resolve(&file.requests[0], &at(&HashMap::new(), &[]))
+    }
+
+    /// An iteration with these responses and loop variables.
+    fn at<'a>(responses: &'a HashMap<String, Captured>, vars: &'a [Binding]) -> Iteration<'a> {
+        Iteration {
+            responses,
+            followed: None,
+            vars,
+        }
+    }
+
+    /// One loop variable bound to `value`.
+    fn bind(var: &str, value: &Value) -> Vec<Binding> {
+        vec![Binding {
+            var: var.to_string(),
+            index: 0,
+            value: value.clone(),
+        }]
     }
 
     fn reference(text: &str) -> Result<Reference> {
@@ -1405,7 +1876,7 @@ mod tests {
         )
         .unwrap();
         let names: Vec<_> = file
-            .references(&file.requests[0])
+            .references(&file.requests[0], &[])
             .unwrap()
             .into_iter()
             .map(|r| r.name)
@@ -1420,12 +1891,14 @@ mod tests {
         )
         .unwrap();
         let responses = HashMap::from([("login".to_string(), captured(BODY))]);
-        let r = file.resolve(&file.requests[0], &responses, None).unwrap();
+        let r = file
+            .resolve(&file.requests[0], &at(&responses, &[]))
+            .unwrap();
         assert_eq!(r.url, "http://a/next");
         assert_eq!(r.headers, [("Authorization".into(), "Bearer t0k".into())]);
 
         let err = file
-            .resolve(&file.requests[0], &HashMap::new(), None)
+            .resolve(&file.requests[0], &at(&HashMap::new(), &[]))
             .unwrap_err();
         assert_eq!(err.to_string(), "no response from \"login\" yet");
     }
@@ -1435,16 +1908,40 @@ mod tests {
     #[test]
     fn parses_foreach_directive() {
         let file = parse(LOOP).unwrap();
-        let foreach = file.requests[0].foreach.as_ref().unwrap();
+        let foreach = &file.requests[0].foreach[0];
         assert_eq!(foreach.var, "item");
-        assert_eq!(foreach.source.name, "login");
+        assert!(matches!(&foreach.source, Source::Response(r) if r.name == "login"));
 
         let file = parse("// @foreach x in {{a.response.body.$}}\nGET http://a\n").unwrap();
-        assert_eq!(file.requests[0].foreach.as_ref().unwrap().var, "x");
+        assert_eq!(file.requests[0].foreach[0].var, "x");
 
         // `@foreachx` is just a comment.
         let file = parse("# @foreachx\nGET http://a\n").unwrap();
-        assert_eq!(file.requests[0].foreach, None);
+        assert!(file.requests[0].foreach.is_empty());
+
+        // Several @foreach lines nest; a source can be an earlier variable.
+        let file = parse(
+            "# @foreach a in {{x.response.body.$}}\n# @foreach b in {{a['k'].list[0]}}\n# @foreach c in {{y.response.body.$.c}}\nGET http://a\n",
+        )
+        .unwrap();
+        let vars: Vec<_> = file.requests[0]
+            .foreach
+            .iter()
+            .map(|f| f.var.as_str())
+            .collect();
+        assert_eq!(vars, ["a", "b", "c"]);
+        assert_eq!(
+            file.requests[0].foreach[1].source,
+            Source::Var {
+                text: "a['k'].list[0]".into(),
+                var: "a".into(),
+                steps: vec![
+                    Step::Key("k".into()),
+                    Step::Key("list".into()),
+                    Step::Index(0)
+                ],
+            }
+        );
     }
 
     #[test]
@@ -1464,8 +1961,12 @@ mod tests {
                 "line 1: invalid @foreach variable",
             ),
             (
-                "# @foreach x in {{list}}\nGET http://a\n",
-                "line 1: @foreach must loop over a {{NAME.response.body.$.path}} reference",
+                "# @foreach x in {{$env LIST}}\nGET http://a\n",
+                "line 1: @foreach must loop over a {{NAME.response.body.$.path}} reference or a loop variable",
+            ),
+            (
+                "# @foreach x in {{list..a}}\nGET http://a\n",
+                "line 1: invalid loop variable reference {{list..a}}",
             ),
             (
                 "# @foreach x in {{a.response.headers.Link}}\nGET http://a\n",
@@ -1484,8 +1985,8 @@ mod tests {
                 "line 1: invalid response reference",
             ),
             (
-                "# @foreach x in {{a.response.body.$}}\n# @foreach y in {{a.response.body.$}}\nGET http://a\n",
-                "line 2: more than one @foreach in a request",
+                "# @foreach x in {{a.response.body.$}}\n# @foreach x in {{a.response.body.$}}\nGET http://a\n",
+                "line 2: @foreach variable \"x\" is used twice",
             ),
         ] {
             let err = format!("{:#}", parse(contents).err().unwrap());
@@ -1500,7 +2001,7 @@ mod tests {
         ))
         .unwrap();
         let names: Vec<_> = file
-            .references(&file.requests[0])
+            .references(&file.requests[0], &[])
             .unwrap()
             .into_iter()
             .map(|r| r.name)
@@ -1511,7 +2012,7 @@ mod tests {
     #[test]
     fn loop_variable_checks() {
         let clash = parse(&format!("@item = 1\n{LOOP}")).unwrap();
-        let err = clash.references(&clash.requests[0]).unwrap_err();
+        let err = clash.references(&clash.requests[0], &[]).unwrap_err();
         assert_eq!(
             err.to_string(),
             "@foreach variable \"item\" has the same name as a file variable"
@@ -1519,7 +2020,7 @@ mod tests {
 
         let bad =
             parse("# @foreach item in {{a.response.body.$}}\nGET http://a/{{item..x}}\n").unwrap();
-        let err = bad.references(&bad.requests[0]).unwrap_err();
+        let err = bad.references(&bad.requests[0], &[]).unwrap_err();
         assert_eq!(
             err.to_string(),
             "invalid loop variable reference {{item..x}}"
@@ -1529,25 +2030,58 @@ mod tests {
         let hidden =
             parse("@v = {{item}}\n# @foreach item in {{a.response.body.$}}\nGET http://a/{{v}}\n")
                 .unwrap();
-        let err = hidden.references(&hidden.requests[0]).unwrap_err();
+        let err = hidden.references(&hidden.requests[0], &[]).unwrap_err();
         assert_eq!(err.to_string(), "undefined variable: item");
     }
 
+    /// The `(var index)` pairs of each iteration, or the error.
+    fn iterations(
+        file: &HttpFile,
+        request: &Request,
+        ctx: &Iteration,
+    ) -> std::result::Result<Vec<String>, String> {
+        file.iterations(request, ctx)
+            .map(|all| {
+                all.iter()
+                    .map(|vars| {
+                        let each: Vec<_> = vars
+                            .iter()
+                            .map(|b| format!("{}{}={}", b.var, b.index, b.value))
+                            .collect();
+                        each.join(" ")
+                    })
+                    .collect()
+            })
+            .map_err(|e| {
+                let vars: Vec<_> = e
+                    .vars
+                    .iter()
+                    .map(|b| format!("{}{}", b.var, b.index))
+                    .collect();
+                format!("[{}] {:#}", vars.join(" "), e.error)
+            })
+    }
+
     #[test]
-    fn loop_items_and_elements() {
+    fn loop_iterations_and_elements() {
         let file = parse(LOOP).unwrap();
         let request = &file.requests[0];
         let responses = HashMap::from([("login".to_string(), captured(BODY))]);
-        let items = file.loop_items(request, &responses).unwrap().unwrap();
-        assert_eq!(items.len(), 2);
+        assert_eq!(
+            iterations(&file, request, &at(&responses, &[])).unwrap(),
+            [r#"item0={"id":7}"#, r#"item1={"id":8}"#]
+        );
 
-        let r = file.resolve(request, &responses, Some(&items[1])).unwrap();
+        let element = serde_json::json!({ "id": 8 });
+        let r = file
+            .resolve(request, &at(&responses, &bind("item", &element)))
+            .unwrap();
         assert_eq!(r.url, r#"http://a/8?all={"id":8}"#);
         assert_eq!(r.headers, [("X-Name".into(), "8".into())]);
 
         let missing = serde_json::json!({ "name": "no id" });
         let err = file
-            .resolve(request, &responses, Some(&missing))
+            .resolve(request, &at(&responses, &bind("item", &missing)))
             .unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -1556,18 +2090,146 @@ mod tests {
 
         let not_array =
             parse("# @foreach x in {{login.response.body.$.token}}\nGET http://a\n").unwrap();
-        let err = not_array
-            .loop_items(&not_array.requests[0], &responses)
-            .unwrap_err();
         assert_eq!(
-            err.to_string(),
-            "@foreach: {{login.response.body.$.token}} is not an array"
+            iterations(&not_array, &not_array.requests[0], &at(&responses, &[])).unwrap_err(),
+            "[] @foreach: {{login.response.body.$.token}} is not an array"
         );
 
         let plain = parse("GET http://a\n").unwrap();
         assert_eq!(
-            plain.loop_items(&plain.requests[0], &responses).unwrap(),
-            None
+            iterations(&plain, &plain.requests[0], &at(&responses, &[])).unwrap(),
+            [""]
+        );
+    }
+
+    #[test]
+    fn nested_loops_iterate_every_combination() {
+        let responses = HashMap::from([
+            (
+                "wcs".to_string(),
+                captured(
+                    r#"{"data": [{"id": "a", "domains": ["x", "y"]}, {"id": "b", "domains": []}, {"id": "c", "domains": ["z"]}]}"#,
+                ),
+            ),
+            ("nums".to_string(), captured("[1, 2]")),
+        ]);
+        let file = parse(concat!(
+            "### inner\n",
+            "# @foreach wc in {{wcs.response.body.$.data}}\n",
+            "# @foreach d in {{wc.domains}}\n",
+            "GET http://a/{{wc.id}}/{{d}}\n",
+            "### product\n",
+            "# @foreach wc in {{wcs.response.body.$.data}}\n",
+            "# @foreach n in {{nums.response.body.$}}\n",
+            "GET http://a/{{wc.id}}/{{n}}\n",
+            "### bad\n",
+            "# @foreach wc in {{wcs.response.body.$.data}}\n",
+            "# @foreach d in {{wc.id}}\n",
+            "GET http://a/\n",
+        ))
+        .unwrap();
+        let ctx = at(&responses, &[]);
+        let short = |r: &Request| -> Vec<String> {
+            file.iterations(r, &ctx)
+                .unwrap()
+                .iter()
+                .map(|vars| file.resolve(r, &at(&responses, vars)).unwrap().url)
+                .collect()
+        };
+        assert_eq!(
+            short(&file.requests[0]),
+            ["http://a/a/x", "http://a/a/y", "http://a/c/z"]
+        );
+        assert_eq!(
+            short(&file.requests[1]),
+            [
+                "http://a/a/1",
+                "http://a/a/2",
+                "http://a/b/1",
+                "http://a/b/2",
+                "http://a/c/1",
+                "http://a/c/2"
+            ]
+        );
+        let all = iterations(&file, &file.requests[0], &ctx).unwrap();
+        assert_eq!(all[2], r#"wc2={"id":"c","domains":["z"]} d0="z""#);
+        assert_eq!(
+            iterations(&file, &file.requests[2], &ctx).unwrap_err(),
+            "[wc0] @foreach: {{wc.id}} is not an array"
+        );
+
+        // A followed loop's variables and response are in scope.
+        let file = parse(concat!(
+            "### follow\n",
+            "# @foreach d in {{per wc.response.body.$.domains}}\n",
+            "GET http://a/{{wc.id}}/{{d}}\n",
+        ))
+        .unwrap();
+        let per_wc = captured(r#"{"domains": ["p", "q"]}"#);
+        let inherited = bind("wc", &serde_json::json!({"id": "a"}));
+        let ctx = Iteration {
+            responses: &responses,
+            followed: Some(("per wc", &per_wc)),
+            vars: &inherited,
+        };
+        let urls: Vec<_> = file
+            .iterations(&file.requests[0], &ctx)
+            .unwrap()
+            .into_iter()
+            .map(|own| {
+                let vars: Vec<_> = inherited.iter().cloned().chain(own).collect();
+                let ctx = Iteration { vars: &vars, ..ctx };
+                file.resolve(&file.requests[0], &ctx).unwrap().url
+            })
+            .collect();
+        assert_eq!(urls, ["http://a/a/p", "http://a/a/q"]);
+    }
+
+    #[test]
+    fn loop_variables_in_scope() {
+        let file = parse(concat!(
+            "### follow\n",
+            "# @foreach d in {{wc.domains}}\n",
+            "# @assert {{wc.id}} == \"{{d}}\"\n",
+            "GET http://a/{{wc.id}}/{{d}}\n",
+        ))
+        .unwrap();
+        let request = &file.requests[0];
+        // Before the followed loop is known, names come without errors.
+        assert!(file.referenced_names(request).unwrap().is_empty());
+        let err = file.references(request, &[]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "@foreach must loop over a {{NAME.response.body.$.path}} reference or an earlier loop variable: {{wc.domains}}"
+        );
+        assert!(file.references(request, &["wc".to_string()]).is_ok());
+        let err = file
+            .references(request, &["wc".to_string(), "d".to_string()])
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "@foreach variable \"d\" is already a loop variable"
+        );
+
+        // A later loop variable is not a source for an earlier @foreach.
+        let file = parse(
+            "# @foreach a in {{b.x}}\n# @foreach b in {{list.response.body.$}}\nGET http://a/\n",
+        )
+        .unwrap();
+        let err = file.references(&file.requests[0], &[]).unwrap_err();
+        assert!(
+            err.to_string().ends_with("earlier loop variable: {{b.x}}"),
+            "{err}"
+        );
+
+        // Names still include references found through file variables.
+        let file = parse(
+            "@v = {{login.response.body.$.v}}\n### r\n# @foreach d in {{wc.list}}\nGET http://a/{{v}}/{{wc.id}}/{{other.response.headers.X}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            file.referenced_names(&file.requests[0]).unwrap(),
+            ["login", "other"]
         );
     }
 
@@ -1576,8 +2238,8 @@ mod tests {
     fn filtered(variables: &str, expr: &str) -> Result<String> {
         let file = parse(&format!("{variables}GET http://a/{{{{{expr}}}}}\n"))?;
         let responses = HashMap::from([("login".to_string(), captured(BODY))]);
-        file.references(&file.requests[0])?;
-        let r = file.resolve(&file.requests[0], &responses, None)?;
+        file.references(&file.requests[0], &[])?;
+        let r = file.resolve(&file.requests[0], &at(&responses, &[]))?;
         Ok(r.url.strip_prefix("http://a/").unwrap().to_string())
     }
 
@@ -1622,7 +2284,7 @@ mod tests {
             "{LOOP}X-Last: {{{{ item | suffix(\"}}}}\") }}}}\n"
         ))
         .unwrap();
-        let err = format!("{:#}", file.references(&file.requests[0]).unwrap_err());
+        let err = format!("{:#}", file.references(&file.requests[0], &[]).unwrap_err());
         assert!(err.contains("missing \")\""), "{err}");
 
         let file = parse(&format!(
@@ -1632,7 +2294,7 @@ mod tests {
         let responses = HashMap::from([("login".to_string(), captured(BODY))]);
         let element = serde_json::json!({ "id": 7 });
         let r = file
-            .resolve(&file.requests[0], &responses, Some(&element))
+            .resolve(&file.requests[0], &at(&responses, &bind("item", &element)))
             .unwrap();
         assert_eq!(r.headers[1], ("X-Last".into(), "7}".into()));
 
@@ -1726,7 +2388,7 @@ mod tests {
         )
         .unwrap();
         let names: Vec<_> = file
-            .references(&file.requests[0])
+            .references(&file.requests[0], &[])
             .unwrap()
             .into_iter()
             .map(|r| r.name)
@@ -1931,10 +2593,13 @@ mod tests {
     fn run_checks(contents: &str, own: &Captured, element: Option<&Value>) -> Vec<String> {
         let file = parse(contents).unwrap();
         let request = file.requests.last().unwrap();
-        file.references(request).unwrap();
+        file.references(request, &[]).unwrap();
         let mut responses = HashMap::new();
         responses.insert("other".to_string(), captured(r#"{"id": 7}"#));
-        file.check(request, own, &responses, element)
+        let vars = element
+            .map(|element| bind(&request.foreach[0].var, element))
+            .unwrap_or_default();
+        file.check(request, own, &at(&responses, &vars))
             .into_iter()
             .map(|r| match r.error {
                 None => format!("ok {}", r.text),
@@ -1967,13 +2632,21 @@ mod tests {
             ),
             (Level::Assert, "status == 200", "{{response.status}}")
         );
-        assert_eq!(checks[0].expected.as_deref(), Some("200"));
+        assert_eq!(checks[0].expected.first().map(String::as_str), Some("200"));
         assert_eq!(
-            (checks[1].level, checks[1].op, checks[1].expected.as_deref()),
+            (
+                checks[1].level,
+                checks[1].op,
+                checks[1].expected.first().map(String::as_str)
+            ),
             (Level::Warn, Op::Contains, Some("js\"on"))
         );
         assert_eq!(
-            (checks[2].level, checks[2].op, checks[2].expected.as_deref()),
+            (
+                checks[2].level,
+                checks[2].op,
+                checks[2].expected.first().map(String::as_str)
+            ),
             (Level::Notice, Op::NotExists, None)
         );
         // `@assertion` is not a check, just a comment.
@@ -2107,7 +2780,7 @@ mod tests {
         ))
         .unwrap();
         let names: Vec<_> = file
-            .references(&file.requests[0])
+            .references(&file.requests[0], &[])
             .unwrap()
             .into_iter()
             .map(|r| r.name)
@@ -2129,7 +2802,10 @@ mod tests {
             ),
         ] {
             let file = parse(&format!("# @assert {check}\nGET http://a/\n")).unwrap();
-            let err = format!("{:#}", file.references(&file.requests[0]).err().unwrap());
+            let err = format!(
+                "{:#}",
+                file.references(&file.requests[0], &[]).err().unwrap()
+            );
             assert!(err.starts_with(message), "{err}");
         }
         // `response.` only means the own response inside checks.
@@ -2140,7 +2816,7 @@ mod tests {
         // A file variable cannot read the checked request's own response.
         let file =
             parse("@s = {{response.status}}\n# @assert {{s}} == 200\nGET http://a/\n").unwrap();
-        let err = file.references(&file.requests[0]).err().unwrap();
+        let err = file.references(&file.requests[0], &[]).err().unwrap();
         assert_eq!(
             format!("{err:#}"),
             "@assert {{s}} == 200: undefined variable: response.status"
@@ -2227,6 +2903,299 @@ mod tests {
                 "fail-if {{response.body.$.missing}} !exists: response body has no value at $.missing",
                 "ok {{response.body.$.name}} !exists",
             ]
+        );
+    }
+
+    #[test]
+    fn let_variables_are_request_local() {
+        let file = parse(concat!(
+            "@base = http://a\n",
+            "### each\n",
+            "# @foreach wc in {{login.response.body.$.items}}\n",
+            "# @let service = services_{{wc.id}}\n",
+            "// @let  path = {{service | prefix(\"services_\")}}/{{other.response.headers.X}}  \n",
+            "# @let empty =\n",
+            "# @assert {{service}} contains \"_7\"\n",
+            "GET {{base}}/{{path}}\n",
+            "X-Service: {{service}}{{empty}}\n",
+            "### other request\n",
+            "GET {{base}}/{{service}}\n",
+        ))
+        .unwrap();
+        let request = &file.requests[0];
+        let names: Vec<_> = request.lets.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["service", "path", "empty"]);
+
+        // A response used in a @let is a dependency.
+        let refs: Vec<_> = file
+            .references(request, &[])
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(refs, ["login", "other"]);
+
+        let mut other = captured("{}");
+        other.headers = vec![("X".into(), "x".into())];
+        let responses = HashMap::from([
+            ("login".to_string(), captured(BODY)),
+            ("other".to_string(), other),
+        ]);
+        let element = serde_json::json!({ "id": 7 });
+        let vars = bind("wc", &element);
+        let r = file.resolve(request, &at(&responses, &vars)).unwrap();
+        assert_eq!(r.url, "http://a/7/x");
+        assert_eq!(r.headers, [("X-Service".into(), "services_7".into())]);
+        let results = file.check(request, &captured("{}"), &at(&responses, &vars));
+        assert_eq!(results[0].error, None);
+
+        // Not visible in other requests.
+        let err = file.references(&file.requests[1], &[]).unwrap_err();
+        assert_eq!(err.to_string(), "undefined variable: service");
+    }
+
+    #[test]
+    fn invalid_let_variables() {
+        for (contents, expected) in [
+            (
+                "# @let x\nGET http://a\n",
+                "line 1: invalid @let (expected \"@let NAME = VALUE\"): @let x",
+            ),
+            (
+                "# @let a.b = 1\nGET http://a\n",
+                "line 1: invalid @let variable (use letters, digits, _ and -): a.b",
+            ),
+            (
+                "# @let = 1\nGET http://a\n",
+                "line 1: invalid @let variable",
+            ),
+            (
+                "# @let a = 1\n# @let a = 2\nGET http://a\n",
+                "line 2: @let variable \"a\" is defined twice",
+            ),
+            (
+                "GET http://a\n# @let a = 1\n",
+                "line 2: @let must come before the request line",
+            ),
+        ] {
+            let err = format!("{:#}", parse(contents).err().unwrap());
+            assert!(err.starts_with(expected), "{contents}: {err}");
+        }
+        // `@letter` is just a comment.
+        assert!(
+            parse("# @letter = 1\nGET http://a\n").unwrap().requests[0]
+                .lets
+                .is_empty()
+        );
+
+        for (contents, expected) in [
+            (
+                "@a = 1\n# @let a = 2\nGET http://a\n",
+                "@let variable \"a\" has the same name as a file variable",
+            ),
+            (
+                "# @foreach a in {{x.response.body.$}}\n# @let a = 2\nGET http://a\n",
+                "@let variable \"a\" has the same name as a loop variable",
+            ),
+            (
+                "# @let a = {{nope}}\nGET http://a\n",
+                "@let a: undefined variable: nope",
+            ),
+            // A @let only sees earlier ones, and file variables never see it.
+            (
+                "# @let a = {{b}}\n# @let b = 1\nGET http://a\n",
+                "@let a: undefined variable: b",
+            ),
+            (
+                "@f = {{a}}\n### r\n# @let a = 1\nGET http://a/{{f}}\n",
+                "undefined variable: a",
+            ),
+        ] {
+            let file = parse(contents).unwrap();
+            let err = format!(
+                "{:#}",
+                file.references(file.requests.last().unwrap(), &[])
+                    .unwrap_err()
+            );
+            assert_eq!(err, expected, "{contents}");
+        }
+        // A loop variable inherited from a followed loop also clashes.
+        let file = parse("# @let wc = 1\nGET http://a\n").unwrap();
+        let err = file
+            .references(&file.requests[0], &["wc".to_string()])
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "@let variable \"wc\" has the same name as a loop variable"
+        );
+    }
+
+    #[test]
+    fn skip_if_conditions() {
+        let file = parse(concat!(
+            "### each\n",
+            "# @foreach wc in {{login.response.body.$.items}}\n",
+            "# @let service = services_{{wc.id}}\n",
+            "# @skip-if {{service}} contains \"8\"\n",
+            "// @skip-if {{wc.disabled}} exists\n",
+            "GET http://a/{{wc.id}}\n",
+        ))
+        .unwrap();
+        let request = &file.requests[0];
+        assert_eq!(request.skips.len(), 2);
+        assert_eq!(request.skips[0].directive(), "@skip-if");
+        file.references(request, &[]).unwrap();
+
+        let responses = HashMap::new();
+        let skip = |element: Value| {
+            let vars = bind("wc", &element);
+            file.skip(request, &at(&responses, &vars))
+                .map_err(|e| format!("{e:#}"))
+        };
+        assert_eq!(skip(serde_json::json!({"id": 7})), Ok(false));
+        assert_eq!(skip(serde_json::json!({"id": 8})), Ok(true));
+        assert_eq!(
+            skip(serde_json::json!({"id": 7, "disabled": false})),
+            Ok(true)
+        );
+
+        // An unreadable value is an error, except with exists.
+        let file = parse(
+            "# @foreach wc in {{a.response.body.$}}\n# @skip-if {{wc.n}} > 1\nGET http://a/\n",
+        )
+        .unwrap();
+        let vars = bind("wc", &serde_json::json!({}));
+        let err = file
+            .skip(&file.requests[0], &at(&responses, &vars))
+            .unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "@skip-if {{wc.n}} > 1: current element has no value at {{wc.n}}"
+        );
+    }
+
+    #[test]
+    fn invalid_skip_if() {
+        let err = parse("GET http://a\n# @skip-if status == 1\n")
+            .err()
+            .unwrap();
+        assert_eq!(
+            err.to_string(),
+            "line 2: @skip-if must come before the request line"
+        );
+        let err = parse("# @skip-if {{x}} ~ 1\nGET http://a\n").err().unwrap();
+        assert!(
+            format!("{err:#}").starts_with("line 1: invalid @skip-if (unknown operator"),
+            "{err:#}"
+        );
+        // `@skip-iffy` is just a comment.
+        assert!(
+            parse("# @skip-iffy\nGET http://a\n").unwrap().requests[0]
+                .skips
+                .is_empty()
+        );
+
+        for (contents, inherited, expected) in [
+            (
+                "# @skip-if {{a}} == 1\nGET http://a\n",
+                &[][..],
+                "@skip-if is only for a looping request (@foreach)",
+            ),
+            (
+                "# @foreach x in {{a.response.body.$}}\n# @skip-if status == 404\nGET http://a\n",
+                &[][..],
+                "@skip-if status == 404: cannot read {{response...}}, since nothing has been sent yet",
+            ),
+            (
+                "# @skip-if {{ response.body.$.x }} exists\nGET http://a\n",
+                &["wc".to_string()][..],
+                "@skip-if {{ response.body.$.x }} exists: cannot read {{response...}}, since nothing has been sent yet",
+            ),
+            (
+                "# @foreach x in {{a.response.body.$}}\n# @skip-if {{nope}} exists\nGET http://a\n",
+                &[][..],
+                "@skip-if {{nope}} exists: undefined variable: nope",
+            ),
+        ] {
+            let file = parse(contents).unwrap();
+            let err = format!(
+                "{:#}",
+                file.references(&file.requests[0], inherited).unwrap_err()
+            );
+            assert_eq!(err, expected, "{contents}");
+        }
+        // Following a loop makes a request loop, so it may skip.
+        let file = parse("# @skip-if {{wc.id}} == 1\nGET http://a\n").unwrap();
+        assert!(
+            file.references(&file.requests[0], &["wc".to_string()])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn in_compares_with_a_list() {
+        assert_eq!(
+            split_list(r#"200, "a,b" , {{x | split(",", 1)}},"q\"," "#),
+            ["200", r#""a,b""#, r#"{{x | split(",", 1)}}"#, r#""q\",""#]
+        );
+
+        let mut own = captured(r#"{"state": "active", "n": 2, "path": "/a/b"}"#);
+        own.status = 404;
+        let results = run_checks(
+            concat!(
+                "@b = b\n",
+                "# @assert status in 200, 404\n",
+                "# @assert status in 200,201\n",
+                "# @assert status !in 200, 201\n",
+                "# @fail-if status !in 200, 404\n",
+                "# @fail-if status in 500, 404\n",
+                "# @assert {{response.body.$.state}} in \"pending\", \"active\"\n",
+                "# @assert {{response.body.$.n}} in 1, 2\n",
+                "# @assert {{response.body.$.path | split(\"/\", -1)}} in a, {{b}}\n",
+                "# @assert {{response.body.$.nope}} in 1\n",
+                "# @assert {{response.body.$.nope}} !in 1\n",
+                "GET http://a/\n",
+            ),
+            &own,
+            None,
+        );
+        assert_eq!(
+            results,
+            [
+                "ok status in 200, 404",
+                "assert status in 200,201: got \"404\"",
+                "ok status !in 200, 201",
+                "ok status !in 200, 404",
+                "fail-if status in 500, 404: matched \"404\"",
+                "ok {{response.body.$.state}} in \"pending\", \"active\"",
+                "ok {{response.body.$.n}} in 1, 2",
+                "ok {{response.body.$.path | split(\"/\", -1)}} in a, {{b}}",
+                "assert {{response.body.$.nope}} in 1: response body has no value at $.nope",
+                "assert {{response.body.$.nope}} !in 1: response body has no value at $.nope",
+            ]
+        );
+
+        for (line, message) in [
+            ("@assert status in", "in needs a value"),
+            ("@assert status in 200,", "in has an empty value"),
+            ("@assert status !in 200, , 201", "!in has an empty value"),
+            (
+                "@assert status in \"200\" x, 201",
+                "unexpected text after the closing quote: x",
+            ),
+        ] {
+            let err = format!(
+                "{:#}",
+                parse(&format!("# {line}\nGET http://a/\n")).err().unwrap()
+            );
+            assert!(err.contains(message), "{line}: {err}");
+        }
+        // Every value is checked like any other text.
+        let file = parse("# @assert status in 200, {{nope}}\nGET http://a/\n").unwrap();
+        let err = format!("{:#}", file.references(&file.requests[0], &[]).unwrap_err());
+        assert_eq!(
+            err,
+            "@assert status in 200, {{nope}}: undefined variable: nope"
         );
     }
 }

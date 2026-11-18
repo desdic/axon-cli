@@ -1084,14 +1084,18 @@ fn missing_element_value_names_the_element() {
 }
 
 #[test]
-fn referencing_a_looping_request_is_reported_before_sending() {
-    let r = run_file(
-        "loop-reference",
-        &loops(&refused_url()),
-        &["-n", "uses each"],
-    );
+fn referencing_a_looping_request_follows_it() {
+    let base = start_server();
+    let r = run_file("loop-reference", &loops(&base), &["-n", "uses each"]);
 
-    assert_error(&r, "request \"each\" loops (@foreach)");
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let iterations = r.stdout.as_array().expect("a following -n prints an array");
+    assert_eq!(iterations.len(), 2);
+    assert_eq!(iterations[1]["loop"], json!({"user": 1}));
+    assert_eq!(
+        echo_field(&iterations[1], "x_test"),
+        json!(["application/json"])
+    );
 }
 
 #[test]
@@ -1537,5 +1541,257 @@ GET {base}/list
             {"level": "warn", "check": "{{response.body.$.one}} == \"x\"", "ok": false, "if": true, "error": "matched \"x\""},
             {"level": "notice", "check": "{{response.body.$.users[0].name}} == \"carl\"", "ok": true, "if": true},
         ])
+    );
+}
+
+// --- nested loops ----------------------------------------------------------
+
+const NESTED: &str = "\
+### list
+GET BASE/list
+
+### pairs
+# @foreach a in {{list.response.body.$.users}}
+# @foreach b in {{list.response.body.$.users}}
+GET BASE/json
+X-Test: {{a.name}}-{{b.name}}
+
+### each
+# @foreach user in {{list.response.body.$.users}}
+GET BASE/json
+X-Test: {{user.name}}
+X-Test: {{user.id}}
+
+### per each
+# @foreach t in {{each.response.body.$.x_test}}
+GET BASE/json
+X-Test: {{user.name}}:{{t}}
+
+### after each
+GET BASE/json
+X-Test: {{each.response.body.$.x_test[0]}}-{{user.id}}
+
+### checked each
+# @foreach user in {{list.response.body.$.users}}
+# @assert {{user.name}} == \"ann\"
+GET BASE/json
+
+### after checked
+GET BASE/json
+X-Test: {{checked each.response.body.$.method}}-{{user.name}}
+
+### pairs missing
+# @foreach a in {{list.response.body.$.users}}
+# @foreach b in {{list.response.body.$.users}}
+GET BASE/json
+X-Test: {{b.nope}}
+
+### two loops
+GET BASE/json
+X-Test: {{each.response.body.$.method}}{{pairs.response.body.$.method}}
+
+### unknown source
+# @foreach t in {{user.tags}}
+GET BASE/json
+";
+
+fn nested(base: &str) -> String {
+    NESTED.replace("BASE", base)
+}
+
+/// The `x_test` header values the server saw in each iteration.
+fn x_tests(iterations: &Value) -> Vec<Value> {
+    iterations
+        .as_array()
+        .expect("an array of iterations")
+        .iter()
+        .map(|iteration| echo_field(iteration, "x_test"))
+        .collect()
+}
+
+#[test]
+fn nested_loops_run_every_combination() {
+    let base = start_server();
+    let r = run_file("nested-pairs", &nested(&base), &["-n", "pairs"]);
+
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(
+        x_tests(&r.stdout),
+        [
+            json!(["ann-ann"]),
+            json!(["ann-bob"]),
+            json!(["bob-ann"]),
+            json!(["bob-bob"])
+        ]
+    );
+    assert_eq!(r.stdout[1]["loop"], json!({"a": 0, "b": 1}));
+}
+
+#[test]
+fn following_a_loop_runs_per_iteration() {
+    let base = start_server();
+    let r = run_file(
+        "nested-follow",
+        &nested(&base),
+        &["-n", "per each", "-n", "after each"],
+    );
+
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    // `each` runs once (as a dependency), then each follower per iteration.
+    assert_eq!(
+        x_tests(&r.stdout[0]),
+        [
+            json!(["ann:ann"]),
+            json!(["ann:1"]),
+            json!(["bob:bob"]),
+            json!(["bob:2"])
+        ]
+    );
+    assert_eq!(r.stdout[0][3]["loop"], json!({"user": 1, "t": 1}));
+    assert_eq!(x_tests(&r.stdout[1]), [json!(["ann-1"]), json!(["bob-2"])]);
+
+    // The default output prints the list, both `each` iterations, and the
+    // four iterations that follow them.
+    let (code, stdout) = run_body("nested-follow-raw", &nested(&base), &["-n", "per each"]);
+    assert_eq!(code, 0);
+    assert_eq!(response_count(&stdout), 7);
+}
+
+#[test]
+fn failed_iterations_skip_only_what_follows_them() {
+    let base = start_server();
+    let (code, stdout, stderr) = run_raw(
+        "nested-skip",
+        &nested(&base),
+        &["-n", "after checked", "--json"],
+    );
+
+    assert_eq!(code, 1);
+    assert_eq!(
+        stderr,
+        [
+            "FAIL request \"checked each\" (element 1): {{user.name}} == \"ann\": got \"bob\"",
+            "SKIP request \"after checked\" (element 1): \"checked each\" (element 1) failed its checks",
+            r#"{"error":"1 check failed, 1 request skipped"}"#,
+        ]
+    );
+    let output: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(x_tests(&output), [json!(["GET-ann"])]);
+}
+
+#[test]
+fn nested_loop_errors_name_every_variable() {
+    let base = start_server();
+    let r = run_file("nested-missing", &nested(&base), &["-n", "pairs missing"]);
+    assert_error(
+        &r,
+        "request \"pairs missing\" (a 0, b 0): current element has no value at {{b.nope}}",
+    );
+
+    let r = run_file("nested-two", &nested(&refused_url()), &["-n", "two loops"]);
+    assert_error(
+        &r,
+        "request \"two loops\": references more than one looping request: \"each\" and \"pairs\"",
+    );
+
+    let r = run_file(
+        "nested-unknown",
+        &nested(&refused_url()),
+        &["-n", "unknown source"],
+    );
+    assert_error(
+        &r,
+        "request \"unknown source\": @foreach must loop over a {{NAME.response.body.$.path}} reference or an earlier loop variable: {{user.tags}}",
+    );
+}
+
+#[test]
+fn let_variables_per_iteration() {
+    let base = start_server();
+    let file = format!(
+        "\
+### list
+GET {base}/list
+
+### each
+# @foreach user in {{{{list.response.body.$.users}}}}
+# @let tag = user_{{{{user.id}}}}
+# @let shout = {{{{tag}}}}-{{{{user.name}}}}
+# @warn-if {{{{shout}}}} contains \"bob\"
+GET {base}/json
+X-Test: {{{{shout}}}}
+"
+    );
+    let (code, stdout, stderr) = run_raw("let-loop", &file, &["-n", "each", "--json"]);
+
+    assert_eq!(code, 0, "{stderr:?}");
+    assert_eq!(
+        stderr,
+        [
+            "WARN request \"each\" (element 1): if {{shout}} contains \"bob\": matched \"user_2-bob\""
+        ]
+    );
+    let output: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        x_tests(&output),
+        [json!(["user_1-ann"]), json!(["user_2-bob"])]
+    );
+}
+
+#[test]
+fn skip_if_leaves_out_iterations() {
+    let base = start_server();
+    let file = format!(
+        "\
+### list
+GET {base}/list
+
+### each
+# @foreach user in {{{{list.response.body.$.users}}}}
+# @let tag = user_{{{{user.name}}}}
+# @skip-if {{{{tag}}}} contains \"ann\"
+# @assert status == 200
+GET {base}/json
+X-Test: {{{{tag}}}}
+
+### after each
+GET {base}/json
+X-Test: {{{{each.response.body.$.x_test[0]}}}}
+"
+    );
+    let r = run_file("skip-if", &file, &["-n", "each", "-n", "after each"]);
+
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(x_tests(&r.stdout[0]), [json!(["user_bob"])]);
+    // The index of the iteration that ran is kept, showing the gap.
+    assert_eq!(r.stdout[0][0]["loop"], json!({"user": 1}));
+    // Followers run only for the iterations that were sent.
+    assert_eq!(x_tests(&r.stdout[1]), [json!(["user_bob"])]);
+
+    let (code, stdout) = run_body("skip-if-raw", &file, &["-n", "each"]);
+    assert_eq!(code, 0);
+    assert_eq!(response_count(&stdout), 2, "the list and one iteration");
+}
+
+#[test]
+fn in_accepts_any_listed_status() {
+    let base = start_server();
+    let file = format!(
+        "\
+### missing
+# @assert status in 200, 404
+# @fail-if status !in 200, 201, 204
+GET {base}/missing
+"
+    );
+    let (code, _, stderr) = run_raw("in-status", &file, &["-n", "missing"]);
+
+    assert_eq!(code, 1);
+    assert_eq!(
+        stderr,
+        [
+            "FAIL request \"missing\": if status !in 200, 201, 204: matched \"404\"",
+            r#"{"error":"1 check failed"}"#,
+        ]
     );
 }

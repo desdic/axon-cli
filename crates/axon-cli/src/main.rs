@@ -158,15 +158,23 @@ fn run(args: Args) -> Result<(Output, Option<String>)> {
         .build()?;
 
     let no_responses = HashMap::new();
+    let alone = httpfile::Iteration {
+        responses: &no_responses,
+        followed: None,
+        vars: &[],
+    };
     for step in steps.iter_mut().filter(|step| !step.chained) {
         step.builder = Some(
-            file.resolve(step.request, &no_responses, None)
+            file.resolve(step.request, &alone)
                 .and_then(|request| build(&client, request, netrc.as_deref()))
                 .with_context(|| format!("request \"{}\"", step.label))?,
         );
     }
 
     let mut responses = HashMap::new();
+    // The iterations of each looping request, by name, for the requests
+    // that follow it.
+    let mut loops: HashMap<String, Vec<LoopRun>> = HashMap::new();
     let mut json_output = Vec::new();
     let mut stdout = std::io::stdout().lock();
     let mut last_byte = None;
@@ -187,104 +195,154 @@ fn run(args: Args) -> Result<(Output, Option<String>)> {
             }
             continue;
         }
-        // A looping request runs once per element; any other request once.
-        let elements = match file
-            .loop_items(step.request, &responses)
-            .with_context(|| label.clone())?
-        {
-            Some(items) => items.into_iter().map(Some).collect(),
+        let mut iterations = Vec::new();
+        let mut runs = Vec::new();
+        let mut step_failed = false;
+        // A request that follows a looping request runs for each of its
+        // iterations; any other request once, plus its own @foreach.
+        let outer: Vec<Option<&LoopRun>> = match &step.follows {
+            Some(name) => loops
+                .get(name)
+                .map(|runs| runs.iter().map(Some).collect())
+                .unwrap_or_default(),
             None => vec![None],
         };
-        let looping = step.request.foreach.is_some();
-        let mut iterations = Vec::new();
-        let mut step_failed = false;
-        for (i, element) in elements.iter().enumerate() {
-            let label = || {
-                if looping {
-                    format!("{label} (element {i})")
-                } else {
-                    label.clone()
-                }
-            };
-            let builder = match step.builder.take() {
-                Some(builder) => builder,
-                None => file
-                    .resolve(step.request, &responses, element.as_ref())
-                    .and_then(|request| build(&client, request, netrc.as_deref()))
-                    .with_context(label)?,
-            };
-            let received = builder
-                .send()
-                .map_err(anyhow::Error::from)
-                .and_then(Received::read)
-                .with_context(label)?;
-            let captured = received.captured();
-            let checks = file.check(step.request, &captured, &responses, element.as_ref());
-            // Responses of a looping request cannot be referenced.
-            if let Some(name) = step.request.name.as_ref().filter(|_| !looping) {
-                responses.insert(name.clone(), captured);
+        for run in outer {
+            let inherited = run.map_or(&[][..], |run| run.vars.as_slice());
+            if let Some(run) = run
+                && run.failed
+            {
+                let followed = step.follows.as_deref().unwrap_or_default();
+                let at = describe(&run.vars);
+                eprintln!("SKIP {label}{at}: \"{followed}\"{at} failed its checks");
+                skipped += 1;
+                continue;
             }
-
-            if args.json {
-                if step.selected || args.with_deps {
-                    let mut output = received.json(step.index, step.request.name.as_deref());
-                    if !step.selected {
-                        output["dependency"] = json!(true);
-                    }
-                    if !step.request.checks.is_empty() {
-                        output["checks"] = checks_json(&checks);
-                    }
-                    iterations.push(output);
-                }
-            // -b prints only the -n requests; the default output prints every response.
-            } else if !args.body || step.selected {
-                let mut output = Vec::new();
-                if !args.body {
-                    // Start each later header block on its own line; bare bodies stay as sent.
-                    if last_byte.is_some_and(|byte| byte != b'\n') {
-                        output.push(b'\n');
-                    }
-                    output.extend_from_slice(received.head().as_bytes());
-                }
-                output.extend_from_slice(&received.body);
-                stdout
-                    .write_all(&output)
-                    .and_then(|()| stdout.flush())
-                    .context("failed to write body")?;
-                last_byte = output.last().copied().or(last_byte);
-            }
-
-            // Failed checks are reported after the response they belong to.
-            for check in &checks {
-                let Some(error) = &check.error else {
+            let followed = step.follows.as_deref().zip(run.map(|run| &run.captured));
+            let combinations = file
+                .iterations(
+                    step.request,
+                    &httpfile::Iteration {
+                        responses: &responses,
+                        followed,
+                        vars: inherited,
+                    },
+                )
+                .map_err(|err| {
+                    let vars: Vec<_> = inherited.iter().cloned().chain(err.vars).collect();
+                    err.error.context(format!("{label}{}", describe(&vars)))
+                })?;
+            for own in combinations {
+                let vars: Vec<httpfile::Binding> = inherited.iter().cloned().chain(own).collect();
+                let at = describe(&vars);
+                let label = || format!("{label}{at}");
+                let ctx = httpfile::Iteration {
+                    responses: &responses,
+                    followed,
+                    vars: &vars,
+                };
+                // `@skip-if`: this iteration is not sent, like `continue`.
+                if file.skip(step.request, &ctx).with_context(label)? {
                     continue;
+                }
+                let builder = match step.builder.take() {
+                    Some(builder) => builder,
+                    None => file
+                        .resolve(step.request, &ctx)
+                        .and_then(|request| build(&client, request, netrc.as_deref()))
+                        .with_context(label)?,
                 };
-                let tag = match check.level {
-                    httpfile::Level::Assert => "FAIL",
-                    httpfile::Level::Warn => "WARN",
-                    httpfile::Level::Notice => "NOTICE",
-                };
-                // A `-if` check reads `if CHECK: matched ...`.
-                let condition = if check.inverted { "if " } else { "" };
-                eprintln!("{tag} {}: {condition}{}: {error}", label(), check.text);
-                if check.level == httpfile::Level::Assert
-                    || (args.strict && check.level == httpfile::Level::Warn)
-                {
-                    failed_checks += 1;
-                    step_failed = true;
+                let received = builder
+                    .send()
+                    .map_err(anyhow::Error::from)
+                    .and_then(Received::read)
+                    .with_context(label)?;
+                let captured = received.captured();
+                let checks = file.check(step.request, &captured, &ctx);
+
+                if args.json {
+                    if step.selected || args.with_deps {
+                        let mut output = received.json(step.index, step.request.name.as_deref());
+                        if !step.selected {
+                            output["dependency"] = json!(true);
+                        }
+                        if step.looping {
+                            output["loop"] = loop_json(&vars);
+                        }
+                        if !step.request.checks.is_empty() {
+                            output["checks"] = checks_json(&checks);
+                        }
+                        iterations.push(output);
+                    }
+                // -b prints only the -n requests; the default output prints every response.
+                } else if !args.body || step.selected {
+                    let mut output = Vec::new();
+                    if !args.body {
+                        // Start each later header block on its own line; bare bodies stay as sent.
+                        if last_byte.is_some_and(|byte| byte != b'\n') {
+                            output.push(b'\n');
+                        }
+                        output.extend_from_slice(received.head().as_bytes());
+                    }
+                    output.extend_from_slice(&received.body);
+                    stdout
+                        .write_all(&output)
+                        .and_then(|()| stdout.flush())
+                        .context("failed to write body")?;
+                    last_byte = output.last().copied().or(last_byte);
+                }
+
+                // Failed checks are reported after the response they belong to.
+                let mut iteration_failed = false;
+                for check in &checks {
+                    let Some(error) = &check.error else {
+                        continue;
+                    };
+                    let tag = match check.level {
+                        httpfile::Level::Assert => "FAIL",
+                        httpfile::Level::Warn => "WARN",
+                        httpfile::Level::Notice => "NOTICE",
+                    };
+                    // A `-if` check reads `if CHECK: matched ...`.
+                    let condition = if check.inverted { "if " } else { "" };
+                    eprintln!("{tag} {}: {condition}{}: {error}", label(), check.text);
+                    if check.level == httpfile::Level::Assert
+                        || (args.strict && check.level == httpfile::Level::Warn)
+                    {
+                        failed_checks += 1;
+                        iteration_failed = true;
+                    }
+                }
+                step_failed |= iteration_failed;
+
+                // A looping request's iterations are kept for the requests
+                // that follow it; any other response by name.
+                if step.looping {
+                    runs.push(LoopRun {
+                        vars,
+                        captured,
+                        failed: iteration_failed,
+                    });
+                } else if let Some(name) = &step.request.name {
+                    responses.insert(name.clone(), captured);
                 }
             }
         }
         if let Some(name) = &step.request.name {
-            if step_failed {
+            // Failed iterations of a looping request only skip the
+            // iterations that follow them.
+            if step_failed && !step.looping {
                 failed.insert(name.clone());
             } else {
                 failed.remove(name);
             }
+            if step.looping {
+                loops.insert(name.clone(), runs);
+            }
         }
         // A looping -n takes one JSON slot holding all of its iterations.
         if args.json && (step.selected || args.with_deps) {
-            if looping {
+            if step.looping {
                 json_output.push(Value::Array(iterations));
             } else {
                 json_output.extend(iterations);
@@ -308,6 +366,39 @@ fn run(args: Args) -> Result<(Output, Option<String>)> {
         Value::Array(json_output)
     };
     Ok((Output::Json(output), summary))
+}
+
+/// One iteration of a looping request, for the requests that follow it.
+struct LoopRun {
+    vars: Vec<httpfile::Binding>,
+    captured: httpfile::Captured,
+    /// It failed a check that counts.
+    failed: bool,
+}
+
+/// How messages name an iteration: ` (element 2)` with one loop variable,
+/// ` (wc 2, domain 0)` with more, nothing without.
+fn describe(vars: &[httpfile::Binding]) -> String {
+    match vars {
+        [] => String::new(),
+        [one] => format!(" (element {})", one.index),
+        _ => {
+            let each: Vec<_> = vars
+                .iter()
+                .map(|binding| format!("{} {}", binding.var, binding.index))
+                .collect();
+            format!(" ({})", each.join(", "))
+        }
+    }
+}
+
+/// The index of each loop variable in an iteration, for `--json`.
+fn loop_json(vars: &[httpfile::Binding]) -> Value {
+    Value::Object(
+        vars.iter()
+            .map(|binding| (binding.var.clone(), json!(binding.index)))
+            .collect(),
+    )
 }
 
 /// `1 check failed`, `2 checks failed`.
@@ -352,6 +443,10 @@ struct Step<'a> {
     /// Names of the requests whose responses it uses; it is skipped when one
     /// of them failed its checks.
     depends_on: Vec<String>,
+    /// The looping request it follows: it runs once per iteration of it.
+    follows: Option<String>,
+    /// Runs once per iteration: it has `@foreach` lines or follows a loop.
+    looping: bool,
     builder: Option<RequestBuilder>,
 }
 
@@ -364,6 +459,7 @@ fn plan<'a>(file: &'a httpfile::HttpFile, selectors: &[String]) -> Result<Vec<St
         steps: Vec::new(),
         responded: HashSet::new(),
         stack: Vec::new(),
+        loops: HashMap::new(),
     };
     for selector in selectors {
         let (index, request) = select(&file.requests, selector)?;
@@ -381,6 +477,9 @@ struct Planner<'a> {
     responded: HashSet<usize>,
     /// Indexes of the requests being visited, to detect cycles.
     stack: Vec<usize>,
+    /// Whether each planned request loops, by index, with the loop
+    /// variables in its scope (those of the loop it follows first).
+    loops: HashMap<usize, (bool, Vec<String>)>,
 }
 
 impl<'a> Planner<'a> {
@@ -408,30 +507,42 @@ impl<'a> Planner<'a> {
             bail!("dependency cycle: {}", cycle.join(" -> "));
         }
 
-        let references = self.file.references(request)?;
+        let names = self.file.referenced_names(request)?;
         self.stack.push(index);
-        for reference in &references {
-            let name = &reference.name;
+        let mut follows: Option<(&String, usize)> = None;
+        for name in &names {
             let (dep_index, dependency) = find_named(&self.file.requests, name)?
                 .with_context(|| format!("no request named \"{name}\""))?;
             if dep_index == index {
                 bail!("request \"{name}\" depends on itself");
             }
-            if dependency.foreach.is_some() {
-                bail!("request \"{name}\" loops (@foreach), so its responses cannot be referenced");
-            }
             self.visit(dep_index, dependency, name, false)
                 .with_context(|| format!("request \"{name}\""))?;
+            if self.loops[&dep_index].0 {
+                if let Some((other, _)) = follows {
+                    bail!("references more than one looping request: \"{other}\" and \"{name}\"");
+                }
+                follows = Some((name, dep_index));
+            }
         }
         self.stack.pop();
+
+        // Now that the loop it follows is known, check its variables.
+        let mut vars = follows.map_or_else(Vec::new, |(_, i)| self.loops[&i].1.clone());
+        self.file.references(request, &vars)?;
+        vars.extend(request.foreach.iter().map(|foreach| foreach.var.clone()));
+        let looping = !request.foreach.is_empty() || follows.is_some();
+        self.loops.insert(index, (looping, vars));
 
         self.steps.push(Step {
             index,
             request,
             label: label.to_string(),
             selected,
-            chained: !references.is_empty(),
-            depends_on: references.iter().map(|r| r.name.clone()).collect(),
+            chained: !names.is_empty(),
+            follows: follows.map(|(name, _)| name.clone()),
+            looping,
+            depends_on: names,
             builder: None,
         });
         self.responded.insert(index);
