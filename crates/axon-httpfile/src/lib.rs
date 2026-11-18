@@ -6,11 +6,13 @@
 //! `{{value | split("/", -1) | trim}}`, loops with `# @foreach VAR in {{NAME.response.body.$.path}}`,
 //! and response checks with `# @assert`, `# @warn` and `# @notice`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
+#[derive(Default)]
 pub struct HttpFile {
     /// File variables in definition order, with their values unsubstituted.
     variables: Vec<(String, String)>,
@@ -21,6 +23,9 @@ pub struct HttpFile {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Request {
     pub name: Option<String>,
+    /// The file the request is written in: the path given to
+    /// [`parse_file`], or resolved from `import` lines; empty for [`parse`].
+    pub file: String,
     /// Uppercased.
     pub method: String,
     pub url: String,
@@ -933,31 +938,169 @@ fn parse_path(path: &str) -> Result<Vec<Step>> {
     Ok(steps)
 }
 
+/// Parses `.http` text that is not read from a file; `import` paths are
+/// relative to the current directory.
 pub fn parse(contents: &str) -> Result<HttpFile> {
-    let mut file = HttpFile {
-        variables: Vec::new(),
-        requests: Vec::new(),
-    };
-    let mut block = Vec::new();
-    let mut name = None;
-    let mut start = 1;
-    let mut last = 0;
-    for (index, line) in contents.lines().enumerate() {
-        last = index + 1;
-        if let Some(rest) = line.strip_prefix("###") {
-            file.parse_block(name.take(), (start, last - 1), &block)?;
-            block.clear();
-            name = clean_name(rest);
-            start = last;
-        } else {
-            block.push((last, line));
-        }
-    }
-    file.parse_block(name, (start, last), &block)?;
+    let mut file = HttpFile::default();
+    file.parse_text(contents, "", &mut Imports::default())
+        .map_err(unnest)?;
     Ok(file)
 }
 
+/// Reads and parses a `.http` file, including the files it imports.
+pub fn parse_file(path: &Path) -> Result<HttpFile> {
+    let display = path.display().to_string();
+    let contents =
+        std::fs::read_to_string(path).with_context(|| format!("failed to read {display}"))?;
+    let mut imports = Imports::default();
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        imports.included.insert(canonical.clone());
+        imports.stack.push((canonical, display.clone()));
+    }
+    let mut file = HttpFile::default();
+    file.parse_text(&contents, &display, &mut imports)
+        .map_err(unnest)?;
+    Ok(file)
+}
+
+/// The files included so far in one parse, by canonical path, and the chain
+/// of files being imported (with their displayed paths), to detect cycles.
+#[derive(Default)]
+struct Imports {
+    included: HashSet<PathBuf>,
+    stack: Vec<(PathBuf, String)>,
+}
+
+/// The file whose lines are being parsed.
+struct Origin<'a> {
+    /// As shown in messages and the listing; empty for [`parse`].
+    display: &'a str,
+    /// A request has been parsed, so `import` lines are no longer allowed.
+    requests_seen: bool,
+}
+
+/// An error from an imported file, which already names that file, passed up
+/// through the importing files unchanged.
+#[derive(Debug)]
+struct Nested(anyhow::Error);
+
+impl std::fmt::Display for Nested {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for Nested {}
+
+/// The error inside a [`Nested`] one, or the error itself.
+fn unnest(err: anyhow::Error) -> anyhow::Error {
+    match err.downcast::<Nested>() {
+        Ok(Nested(inner)) => inner,
+        Err(err) => err,
+    }
+}
+
+/// The path of an `import PATH` line, an error for `import` without one, or
+/// `None` when the line is not an import.
+fn import_line(line: &str) -> Option<Result<&str>> {
+    let rest = line.strip_prefix("import")?;
+    if rest.trim().is_empty() {
+        return Some(Err(anyhow::anyhow!("import needs a path")));
+    }
+    rest.starts_with(char::is_whitespace)
+        .then(|| Ok(rest.trim()))
+}
+
 impl HttpFile {
+    /// Parses the lines of one file, `display` naming it in errors.
+    fn parse_text(&mut self, contents: &str, display: &str, imports: &mut Imports) -> Result<()> {
+        let mut origin = Origin {
+            display,
+            requests_seen: false,
+        };
+        self.parse_lines(contents, &mut origin, imports)
+            .map_err(|err| {
+                if err.is::<Nested>() || display.is_empty() {
+                    err
+                } else {
+                    err.context(format!("failed to parse {display}"))
+                }
+            })
+    }
+
+    fn parse_lines(
+        &mut self,
+        contents: &str,
+        origin: &mut Origin,
+        imports: &mut Imports,
+    ) -> Result<()> {
+        let mut block = Vec::new();
+        let mut name = None;
+        let mut start = 1;
+        let mut last = 0;
+        for (index, line) in contents.lines().enumerate() {
+            last = index + 1;
+            if let Some(rest) = line.strip_prefix("###") {
+                self.parse_block(name.take(), (start, last - 1), &block, origin, imports)?;
+                block.clear();
+                name = clean_name(rest);
+                start = last;
+            } else {
+                block.push((last, line));
+            }
+        }
+        self.parse_block(name, (start, last), &block, origin, imports)
+    }
+
+    /// Adds the variables and requests of the file at `path`, relative to
+    /// the importing file, unless it is already included.
+    fn import(
+        &mut self,
+        path: &str,
+        line_no: usize,
+        origin: &Origin,
+        imports: &mut Imports,
+    ) -> Result<()> {
+        let target = Path::new(origin.display)
+            .parent()
+            .unwrap_or(Path::new(""))
+            .join(path);
+        let display = target.display().to_string();
+        let importer = if origin.display.is_empty() {
+            "input"
+        } else {
+            origin.display
+        };
+        let unreadable = |err: std::io::Error| {
+            Nested(anyhow::Error::new(err).context(format!(
+                "failed to read {display} (imported by {importer} line {line_no})"
+            )))
+        };
+        let canonical = std::fs::canonicalize(&target).map_err(unreadable)?;
+        if let Some(start) = imports.stack.iter().position(|(c, _)| *c == canonical) {
+            let chain: Vec<_> = imports.stack[start..]
+                .iter()
+                .map(|(_, shown)| shown.as_str())
+                .chain([display.as_str()])
+                .collect();
+            bail!("line {line_no}: import cycle: {}", chain.join(" -> "));
+        }
+        if !imports.included.insert(canonical.clone()) {
+            return Ok(());
+        }
+        let contents = std::fs::read_to_string(&target).map_err(unreadable)?;
+        imports.stack.push((canonical, display.clone()));
+        let result = self.parse_text(&contents, &display, imports);
+        imports.stack.pop();
+        result.map_err(|err| {
+            if err.is::<Nested>() {
+                err
+            } else {
+                Nested(err).into()
+            }
+        })
+    }
+
     /// Parses the lines between two `###` separators. A block without a
     /// request line (e.g. only variables or comments) adds no request.
     fn parse_block(
@@ -965,6 +1108,8 @@ impl HttpFile {
         mut name: Option<String>,
         (start_line, end_line): (usize, usize),
         lines: &[(usize, &str)],
+        origin: &mut Origin,
+        imports: &mut Imports,
     ) -> Result<()> {
         let mut lines = lines.iter();
         let mut foreach: Vec<Foreach> = Vec::new();
@@ -1014,6 +1159,12 @@ impl HttpFile {
                 };
                 self.variables
                     .push((var.trim().to_string(), value.trim().to_string()));
+            } else if let Some(path) = import_line(line) {
+                if origin.requests_seen {
+                    bail!("line {line_no}: import must come before the first request");
+                }
+                let path = path.with_context(|| format!("line {line_no}"))?;
+                self.import(path, line_no, origin, imports)?;
             } else {
                 break (line_no, line);
             }
@@ -1043,6 +1194,8 @@ impl HttpFile {
             let line = line.trim();
             if line.is_empty() {
                 in_body = true;
+            } else if import_line(line).is_some() {
+                bail!("line {line_no}: import must come before the first request");
             } else if let_directive(line).is_some() {
                 bail!("line {line_no}: @let must come before the request line");
             } else if skip_directive(line).is_some() {
@@ -1063,8 +1216,10 @@ impl HttpFile {
             body.pop();
         }
 
+        origin.requests_seen = true;
         self.requests.push(Request {
             name,
+            file: origin.display.to_string(),
             method: method.to_ascii_uppercase(),
             url: url.to_string(),
             headers,
@@ -1122,7 +1277,7 @@ impl HttpFile {
         };
         for skip in &request.skips {
             let mut eval = |text: &str| {
-                self.substitute(text, self.variables.len(), scope, &mut on_reference)
+                self.substitute(text, None, scope, &mut on_reference)
                     .map(Option::unwrap_or_default)
             };
             if skip
@@ -1147,7 +1302,7 @@ impl HttpFile {
             let value = self
                 .substitute(
                     &each.value,
-                    self.variables.len(),
+                    None,
                     Scope {
                         lets: &values,
                         ..scope
@@ -1269,7 +1424,7 @@ impl HttpFile {
         };
         for check in &request.checks {
             for text in check.texts() {
-                self.substitute(text, self.variables.len(), scope, &mut collect)
+                self.substitute(text, None, scope, &mut collect)
                     .with_context(|| format!("{} {}", check.directive(), check.text))?;
             }
         }
@@ -1277,7 +1432,7 @@ impl HttpFile {
         let scope = Scope { own: None, ..scope };
         for skip in &request.skips {
             for text in skip.texts() {
-                self.substitute(text, self.variables.len(), scope, &mut collect)
+                self.substitute(text, None, scope, &mut collect)
                     .with_context(|| format!("{} {}", skip.directive(), skip.text))?;
             }
         }
@@ -1373,7 +1528,7 @@ impl HttpFile {
             .iter()
             .map(|check| {
                 let mut eval = |text: &str| {
-                    self.substitute(text, self.variables.len(), scope, &mut on_reference)
+                    self.substitute(text, None, scope, &mut on_reference)
                         .map(Option::unwrap_or_default)
                 };
                 CheckResult {
@@ -1395,11 +1550,10 @@ impl HttpFile {
         scope: Scope,
         on_reference: OnReference,
     ) -> Result<Request> {
-        let all = self.variables.len();
         // While only checking, unknown values are left empty.
         let mut substitute = |text| {
             Ok::<_, anyhow::Error>(
-                self.substitute(text, all, scope, on_reference)?
+                self.substitute(text, None, scope, on_reference)?
                     .unwrap_or_default(),
             )
         };
@@ -1414,6 +1568,7 @@ impl HttpFile {
         };
         Ok(Request {
             name: request.name.clone(),
+            file: request.file.clone(),
             method: request.method.clone(),
             url,
             headers,
@@ -1427,14 +1582,14 @@ impl HttpFile {
         })
     }
 
-    /// Replaces each `{{...}}` in `text`, seeing only the first `visible`
-    /// file variables (so a variable can only reference earlier ones) and
-    /// what `scope` adds. `None` when a value is not known
-    /// because only the request is being checked.
+    /// Replaces each `{{...}}` in `text`, with file variables, what `scope`
+    /// adds and response references; `chain` holds the file variables being
+    /// substituted, if any. `None` when a value is not known because only
+    /// the request is being checked.
     fn substitute(
         &self,
         text: &str,
-        visible: usize,
+        chain: Option<&Resolving>,
         scope: Scope,
         on_reference: OnReference,
     ) -> Result<Option<String>> {
@@ -1447,7 +1602,7 @@ impl HttpFile {
             let Some(end) = after.find("}}") else {
                 bail!("unterminated \"{{{{\" in: {text}");
             };
-            match self.lookup(after[..end].trim(), visible, scope, on_reference)? {
+            match self.lookup(after[..end].trim(), chain, scope, on_reference)? {
                 Some(value) => out.push_str(&value),
                 None => known = false,
             }
@@ -1461,7 +1616,7 @@ impl HttpFile {
     fn lookup(
         &self,
         text: &str,
-        visible: usize,
+        chain: Option<&Resolving>,
         scope: Scope,
         on_reference: OnReference,
     ) -> Result<Option<String>> {
@@ -1471,7 +1626,7 @@ impl HttpFile {
             .map(Filter::parse)
             .collect::<Result<Vec<_>>>()
             .with_context(|| format!("invalid filter in {{{{{text}}}}}"))?;
-        let Some(mut value) = self.lookup_value(name, visible, scope, on_reference)? else {
+        let Some(mut value) = self.lookup_value(name, chain, scope, on_reference)? else {
             return Ok(None);
         };
         for filter in &filters {
@@ -1486,7 +1641,7 @@ impl HttpFile {
     fn lookup_value(
         &self,
         name: &str,
-        visible: usize,
+        chain: Option<&Resolving>,
         scope: Scope,
         on_reference: OnReference,
     ) -> Result<Option<String>> {
@@ -1534,11 +1689,13 @@ impl HttpFile {
         if let Some(reference) = Reference::parse(name) {
             return on_reference(&reference?);
         }
-        // A redefined variable takes its latest earlier definition.
-        let Some(index) = self.variables[..visible]
-            .iter()
-            .rposition(|(n, _)| n == name)
-        else {
+        // A redefined variable takes its last definition (late binding),
+        // except inside its own value, where it takes the one before.
+        let definitions = match chain.and_then(|chain| chain.index_of(name)) {
+            Some(own) => &self.variables[..own],
+            None => &self.variables[..],
+        };
+        let Some(index) = definitions.iter().rposition(|(n, _)| n == name) else {
             if scope.lenient {
                 return Ok(None);
             }
@@ -1546,12 +1703,41 @@ impl HttpFile {
         };
         // The loop variable and a check's own response are not visible
         // inside file variables.
+        let link = Resolving {
+            name,
+            index,
+            parent: chain,
+        };
         self.substitute(
             &self.variables[index].1,
-            index,
+            Some(&link),
             Scope::default(),
             on_reference,
         )
+    }
+}
+
+/// The file variables being substituted, innermost first: a variable used
+/// inside its own value takes its definition before this one, which also
+/// ends any cycle between variables.
+struct Resolving<'a> {
+    name: &'a str,
+    /// The definition being substituted, in [`HttpFile`]'s variables.
+    index: usize,
+    parent: Option<&'a Resolving<'a>>,
+}
+
+impl Resolving<'_> {
+    /// The definition of `name` being substituted, innermost first.
+    fn index_of(&self, name: &str) -> Option<usize> {
+        let mut link = Some(self);
+        while let Some(current) = link {
+            if current.name == name {
+                return Some(current.index);
+            }
+            link = current.parent;
+        }
+        None
     }
 }
 
@@ -1696,6 +1882,7 @@ mod tests {
     ) -> Request {
         Request {
             name: name.map(Into::into),
+            file: String::new(),
             method: method.into(),
             url: url.into(),
             headers: Vec::new(),
@@ -2539,11 +2726,40 @@ mod tests {
     }
 
     #[test]
-    fn variable_cannot_reference_later_variable() {
-        let err = resolved("@base = https://{{host}}\n@host = a\nGET {{base}}\n")
-            .err()
-            .unwrap();
-        assert_eq!(err.to_string(), "undefined variable: host");
+    fn variables_use_the_last_definition() {
+        let url = |contents: &str| resolved(contents).map(|r| r.url).map_err(|e| e.to_string());
+        // A variable can use one defined later.
+        assert_eq!(
+            url("@base = https://{{host}}\n@host = a\nGET {{base}}\n"),
+            Ok("https://a".into())
+        );
+        // Late binding: a redefinition also applies inside earlier variables.
+        assert_eq!(
+            url("@base = a\n@api = {{base}}/v3\n@base = b\nGET http://{{api}}\n"),
+            Ok("http://b/v3".into())
+        );
+        // A variable used in its own value takes the definition before it.
+        assert_eq!(
+            url("@p = a\n@p = {{p}}/b\n@p = {{p}}/c\nGET http://x/{{p}}\n"),
+            Ok("http://x/a/b/c".into())
+        );
+        assert_eq!(
+            url("@p = {{p}}/b\nGET http://x/{{p}}\n"),
+            Err("undefined variable: p".into())
+        );
+        // A cycle between variables ends at an undefined one, as above.
+        assert_eq!(
+            url("@a = {{b}}\n@b = {{a}}\nGET http://x/{{a}}\n"),
+            Err("undefined variable: a".into())
+        );
+        assert_eq!(
+            url("@a = 1\n@a = {{b}}\n@b = {{a}}2\nGET http://x/{{a}}\n"),
+            Ok("http://x/12".into())
+        );
+        assert_eq!(
+            url("@a = 1\n@a = {{b}}\n@b = {{a}}2\nGET http://x/{{b}}\n"),
+            Err("undefined variable: b".into())
+        );
     }
 
     #[test]
@@ -3197,5 +3413,179 @@ mod tests {
             err,
             "@assert status in 200, {{nope}}: undefined variable: nope"
         );
+    }
+
+    /// A fresh directory holding `files` (relative path, contents).
+    fn files(test: &str, files: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("axon-httpfile-{}-{test}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (path, contents) in files {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        dir
+    }
+
+    fn shown(path: PathBuf) -> String {
+        path.display().to_string()
+    }
+
+    #[test]
+    fn imports_bring_variables_and_requests() {
+        let dir = files(
+            "imports",
+            &[
+                (
+                    "common.http",
+                    "@base = http://common\n@sysapi = {{base}}/v3\n\n### get cluster\nGET {{sysapi}}/clusters/{{cluster}}?base={{base}}\n",
+                ),
+                (
+                    "main.http",
+                    "# shared requests\nimport common.http\n@base = http://main\n@cluster = cf\n\n### webconfigs\nGET {{sysapi}}/{{get cluster.response.body.$.id}}\n",
+                ),
+            ],
+        );
+        let file = parse_file(&dir.join("main.http")).unwrap();
+        let names: Vec<_> = file
+            .requests
+            .iter()
+            .map(|r| r.name.clone().unwrap())
+            .collect();
+        assert_eq!(names, ["get cluster", "webconfigs"]);
+        assert_eq!(file.requests[0].file, shown(dir.join("common.http")));
+        assert_eq!(file.requests[1].file, shown(dir.join("main.http")));
+        assert_eq!(
+            (file.requests[0].start_line, file.requests[0].end_line),
+            (4, 5)
+        );
+
+        // The imported request sees the importing file's variables, and the
+        // later definition of @base wins everywhere, including inside the
+        // imported @sysapi (late binding).
+        let r = file
+            .resolve(&file.requests[0], &at(&HashMap::new(), &[]))
+            .unwrap();
+        assert_eq!(r.url, "http://main/v3/clusters/cf?base=http://main");
+        let names: Vec<_> = file
+            .references(&file.requests[1], &[])
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(names, ["get cluster"]);
+    }
+
+    #[test]
+    fn imports_nest_and_include_each_file_once() {
+        let dir = files(
+            "imports-nested",
+            &[
+                ("shared.http", "@v = 1\n### shared\nGET http://a/{{v}}\n"),
+                (
+                    "sub/b.http",
+                    "import ../shared.http\n### b\nGET http://a/b\n",
+                ),
+                ("a.http", "import shared.http\n### a\nGET http://a/a\n"),
+                (
+                    "main.http",
+                    "import a.http\nimport sub/b.http\n### main\nGET http://a/main\n",
+                ),
+                ("vars.http", "@only = vars\n"),
+                (
+                    "uses-vars.http",
+                    "import vars.http\nGET http://a/{{only}}\n",
+                ),
+            ],
+        );
+        let file = parse_file(&dir.join("main.http")).unwrap();
+        let names: Vec<_> = file
+            .requests
+            .iter()
+            .map(|r| r.name.clone().unwrap())
+            .collect();
+        assert_eq!(names, ["shared", "a", "b", "main"]);
+        assert_eq!(file.requests[2].file, shown(dir.join("sub/b.http")));
+
+        // A file with only variables is a valid import.
+        let file = parse_file(&dir.join("uses-vars.http")).unwrap();
+        let r = file
+            .resolve(&file.requests[0], &at(&HashMap::new(), &[]))
+            .unwrap();
+        assert_eq!(r.url, "http://a/vars");
+    }
+
+    #[test]
+    fn import_errors_name_the_file() {
+        let dir = files(
+            "imports-errors",
+            &[
+                ("missing.http", "import nope.http\nGET http://a\n"),
+                ("bad.http", "@ok = 1\nnot a valid request line here\n"),
+                ("uses-bad.http", "import bad.http\nGET http://a\n"),
+                ("x.http", "import y.http\n"),
+                ("y.http", "\nimport x.http\n"),
+                (
+                    "late.http",
+                    "### a\nGET http://a\n### b\nimport x.http\nGET http://b\n",
+                ),
+                ("in-headers.http", "GET http://a\nimport x.http\n"),
+                ("empty.http", "import\n"),
+            ],
+        );
+        let err = |name: &str| format!("{:#}", parse_file(&dir.join(name)).err().unwrap());
+        let path = |name: &str| shown(dir.join(name));
+
+        let missing = err("missing.http");
+        let expected = format!(
+            "failed to read {} (imported by {} line 1): ",
+            path("nope.http"),
+            path("missing.http")
+        );
+        assert!(missing.starts_with(&expected), "{missing}");
+        assert!(
+            err("uses-bad.http").starts_with(&format!(
+                "failed to parse {}: line 2: invalid request line",
+                path("bad.http")
+            )),
+            "{}",
+            err("uses-bad.http")
+        );
+        assert_eq!(
+            err("x.http"),
+            format!(
+                "failed to parse {}: line 2: import cycle: {} -> {} -> {}",
+                path("y.http"),
+                path("x.http"),
+                path("y.http"),
+                path("x.http")
+            )
+        );
+        for (name, line) in [("late.http", 4), ("in-headers.http", 2)] {
+            assert_eq!(
+                err(name),
+                format!(
+                    "failed to parse {}: line {line}: import must come before the first request",
+                    path(name)
+                )
+            );
+        }
+        assert_eq!(
+            err("empty.http"),
+            format!(
+                "failed to parse {}: line 1: import needs a path",
+                path("empty.http")
+            )
+        );
+        assert_eq!(
+            format!("{:#}", parse_file(&dir.join("absent.http")).err().unwrap()),
+            format!(
+                "failed to read {}: No such file or directory (os error 2)",
+                path("absent.http")
+            )
+        );
+        // A line that only starts with "import" is not an import.
+        let file = parse("imports.example.com/x\n").unwrap();
+        assert_eq!(file.requests[0].url, "imports.example.com/x");
     }
 }
