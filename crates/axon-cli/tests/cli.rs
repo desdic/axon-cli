@@ -242,11 +242,13 @@ fn lists_requests_without_name() {
     );
 
     assert_eq!(r.code, 0);
+    let file = temp_dir("list").join("requests.http");
+    let file = file.to_str().unwrap();
     assert_eq!(
         r.stdout,
         json!([
-            { "index": 1, "name": "first", "method": "GET", "url": "https://{{host}}/a", "start_line": 2, "end_line": 4 },
-            { "index": 2, "name": "second", "method": "POST", "url": "https://{{host}}/b", "start_line": 5, "end_line": 9 },
+            { "index": 1, "name": "first", "file": file, "method": "GET", "url": "https://{{host}}/a", "start_line": 2, "end_line": 4 },
+            { "index": 2, "name": "second", "file": file, "method": "POST", "url": "https://{{host}}/b", "start_line": 5, "end_line": 9 },
         ])
     );
 }
@@ -1794,4 +1796,42 @@ GET {base}/missing
             r#"{"error":"1 check failed"}"#,
         ]
     );
+}
+
+#[test]
+fn imported_requests_run_and_list() {
+    let base = start_server();
+    let dir = temp_dir("imports");
+    std::fs::create_dir_all(dir.join("shared")).unwrap();
+    std::fs::write(
+        dir.join("shared/common.http"),
+        format!("@base = {base}\n\n### get list\n# @assert status == 200\nGET {{{{base}}}}/list\n"),
+    )
+    .unwrap();
+    let main = dir.join("main.http");
+    std::fs::write(
+        &main,
+        "import shared/common.http\n\n### first user\nGET {{base}}/json\nX-Test: {{get list.response.body.$.users[0].name}}\n",
+    )
+    .unwrap();
+    let main = main.to_str().unwrap();
+
+    let r = run_in(&temp_dir("empty-home"), &["-f", main, "-l"], &[]);
+    assert_eq!(r.stdout, json!(["get list", "first user"]));
+
+    let r = run_in(&temp_dir("empty-home"), &["-f", main], &[]);
+    assert_eq!(
+        r.stdout[0]["file"],
+        dir.join("shared/common.http").to_str().unwrap()
+    );
+    assert_eq!(r.stdout[0]["start_line"], 3);
+
+    // The imported request runs first, as a dependency.
+    let r = run_in(
+        &temp_dir("empty-home"),
+        &["-f", main, "-n", "first user"],
+        &[],
+    );
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.echo("x_test"), json!(["ann"]));
 }

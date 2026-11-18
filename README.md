@@ -62,9 +62,40 @@ export API_TOKEN="$(pass show api/staging-token)"
 axon-cli -f api.http -n "create item" -b | jq .id
 ```
 
-- A variable may use earlier variables, so `@base` can be built from `{{$env API_HOST}}` and used everywhere; switching environments only means changing the environment variable.
+- A variable may use other variables, so `@base` can be built from `{{$env API_HOST}}` and used everywhere; switching environments only means changing the environment variable.
+- A variable defined more than once takes its last definition everywhere, also inside other variables: with `@base = a`, `@api = {{base}}/v3`, `@base = b`, `{{api}}` is `b/v3`. A variable used in its own value takes the definition before it: `@path = {{path}}/more`.
 - Keep secrets out of the `.http` file with `{{$env ...}}` (or use `.netrc`, see above).
 - An undefined file variable or unset environment variable is an error (exit 1), reported before any request is sent, for the requests being run only.
+
+### Imports
+
+`import PATH` lines at the top of a file, before its first request, bring in another file's variables and requests (the JetBrains HTTP Client syntax), so shared values and requests can live in one place:
+
+```http
+# common.http
+@sysapi = https://systemsapi.one.com/v3
+
+### get cluster
+# @assert status == 200
+GET {{sysapi}}/find/clusters/by-name/{{cluster}}
+```
+
+```http
+# webconfigs.http
+import common.http
+
+@cluster = cfaceface
+@brand = {{get cluster.response.body.$.data[0].links.self | split("/", -3)}}
+
+### webconfigs
+# @foreach wc in {{webconfig.response.body.$.data}}
+GET {{sysapi}}/brands/{{brand}}/clusters/{{cluster}}/webconfigs/{{wc.id}}
+```
+
+- PATH is relative to the importing file (or absolute). Imported files can import others; each file is included once, and an import cycle is an error.
+- The imported variables and requests are inserted where the `import` line is. Imported requests can be run with `-n`, are listed by `-l` and `-f` (with a `"file"` field), and run as dependencies; their requests can use the importing file's variables (`{{cluster}}` above).
+- A variable defined after the import replaces the imported one everywhere, including inside imported variables: if `common.http` has `@base = https://prod` and `@sysapi = {{base}}/v3`, a `@base = https://staging` after the import makes `{{sysapi}}` `https://staging/v3`.
+- Errors name the file: `failed to parse common.http: line 12: ...`, `failed to read common.http (imported by webconfigs.http line 1): ...`. JetBrains' `run` lines are not supported; use `-n` and dependencies instead.
 
 ### Request-local variables
 
