@@ -66,6 +66,24 @@ axon-cli -f api.http -n "create item" -b | jq .id
 - Keep secrets out of the `.http` file with `{{$env ...}}` (or use `.netrc`, see above).
 - An undefined file variable or unset environment variable is an error (exit 1), reported before any request is sent, for the requests being run only.
 
+### Request-local variables
+
+`# @let NAME = VALUE` before the request line defines a variable for that request only. It can use everything a request can (file variables, `$env`, responses, loop variables, filters and earlier `@let` lines) and is evaluated again for each loop iteration:
+
+```http
+### webconfigs
+# @foreach wc in {{webconfig.response.body.$.data}}
+# @let service = services_{{wc.id}}
+# @let last = {{wc.links.self | split("/", -1)}}
+# @warn-if {{last}} contains {{service}}
+GET {{sysapi}}/brands/{{brand}}/clusters/{{cluster}}/webconfigs/{{wc.id}}
+X-Service: {{service}}
+```
+
+- Visible in the request's URL, headers, body, checks and later `@let` lines; not in other requests (not even ones that follow it), file variables or `@foreach` sources.
+- A plain `@name = value` line is a file variable, visible everywhere, wherever it is written; `@let` is a comment to other tools.
+- Reusing a name, or the name of a file variable or loop variable, is an error, reported before any request is sent.
+
 ### Chaining requests
 
 A request can use values from another request's response, with the VS Code REST Client syntax:
@@ -127,10 +145,60 @@ X-Name: {{user.name}}
 ```
 
 - `axon-cli -f api.http -n "user details"` runs `list users` first (it is a dependency like any other reference), then `user details` once per user, in array order.
-- `{{user}}` is the current element, and `{{user.id}}`, `{{user['first name']}}`, `{{user.tags[0]}}` are values inside it, inserted like other references. The loop variable is letters, digits, `_` and `-`, only visible in its own request (not in file variables), and must not have the same name as a file variable.
+- `{{user}}` is the current element, and `{{user.id}}`, `{{user['first name']}}`, `{{user.tags[0]}}` are values inside it, inserted like other references. The loop variable is letters, digits, `_` and `-`, visible in its own request and in requests that follow it (below), not in file variables, and must not have the same name as a file variable or another loop variable.
 - An empty array sends nothing.
-- The default output prints every iteration; `-b` prints each iteration's body, back to back. With `--json`, a looping `-n` takes one slot holding an array of its iterations, so `-n "list users" -n "user details"` prints `[{...}, [{...}, {...}]]` and a single looping `-n` prints just the array (`[]` when empty).
-- A request can have one `@foreach`, it must loop over a response body, and other requests cannot reference a looping request; these are reported before any request is sent. A value that is not an array, a missing `{{user...}}` value or a failed iteration stops the run with exit 1, naming the element: `request "user details" (element 2): ...`.
+- The default output prints every iteration; `-b` prints each iteration's body, back to back. With `--json`, a looping `-n` takes one slot holding a flat array of its iterations, so `-n "list users" -n "user details"` prints `[{...}, [{...}, {...}]]` and a single looping `-n` prints just the array (`[]` when empty). Each iteration has `"loop": {"user": 2}` with the index of each loop variable.
+- A `@foreach` must loop over a response body or a value inside an earlier loop variable, without filters, and a request can reference at most one looping request; these are reported before any request is sent. A value that is not an array, a missing `{{user...}}` value or a failed iteration stops the run with exit 1, naming the element: `request "user details" (element 2): ...`, or with several loop variables `request "domain details" (wc 2, domain 0): ...`.
+
+#### Nested loops
+
+Several `@foreach` lines nest, the first being the outermost, and the request runs for every combination. A later loop can read an earlier loop variable, or another response:
+
+```http
+### webconfig domains
+# @foreach wc in {{webconfig.response.body.$.data}}
+# @foreach domain in {{wc.attributes.domains}}
+GET {{sysapi}}/webconfigs/{{wc.id}}/domains/{{domain.name}}
+
+### webconfig x domain
+# @foreach wc in {{webconfig.response.body.$.data}}
+# @foreach domain in {{domains.response.body.$.data}}
+GET {{sysapi}}/webconfigs/{{wc.id}}/domains/{{domain.attributes.name}}
+```
+
+The first runs once for each domain inside each webconfig; the second for every webconfig with every domain from the `domains` response.
+
+#### Following a looping request
+
+A request that references a looping request runs once for each of its iterations, after all of them, reading that iteration's response and keeping its loop variables:
+
+```http
+### domains per webconfig
+# @foreach wc in {{webconfig.response.body.$.data}}
+GET {{sysapi}}/webconfigs/{{wc.id}}/domains
+
+### domain details
+# @foreach domain in {{domains per webconfig.response.body.$.data}}
+GET {{sysapi}}/webconfigs/{{wc.id}}/domains/{{domain.id}}
+```
+
+`-n "domain details"` fetches the domains of each webconfig, then the details of each of those domains, with `{{wc.id}}` the webconfig it came from. A request can follow a request that itself follows another. If an iteration fails an `@assert`, only the iterations that follow it are skipped: `SKIP request "domain details" (element 2): "domains per webconfig" (element 2) failed its checks`.
+
+#### Skipping iterations
+
+`# @skip-if CHECK` in a looping request skips the iterations where the check is true, like `continue`. It takes the same checks as [`@assert`](#checks), evaluated before sending, so it can use loop variables, `@let` variables and other responses, but not `{{response...}}`:
+
+```http
+# @foreach wc in {{webconfig.response.body.$.data}}
+# @let service = services_{{wc.id}}
+# @skip-if {{service}} contains "xyz"
+# @skip-if {{wc.attributes.disabled}} == true
+GET {{sysapi}}/brands/{{brand}}/clusters/{{cluster}}/webconfigs/{{wc.id}}
+```
+
+- One true `@skip-if` is enough. A skipped iteration is not sent, printed or checked, and requests that follow the loop do not run for it; with `--json` it is left out, and the `"loop"` indexes of the others show the gap.
+- A value that cannot be read stops the run (exit 1), except with `exists` and `!exists`: `@skip-if {{wc.disabled}} exists`.
+- Only looping requests (with `@foreach`, or following a loop) can use it; this, an invalid line or `{{response...}}` in it is reported before any request is sent.
 
 ### Filters
 
@@ -176,7 +244,8 @@ GET {{sysapi}}/find/clusters/by-name/{{cluster}}
 A check is `SUBJECT OPERATOR [EXPECTED]`:
 
 - SUBJECT is `status` or one `{{...}}` value. Inside a check, `{{response.body.$.path}}`, `{{response.headers.Name}}`, `{{response.cookies.name}}` and `{{response.status}}` read the request's own response (for a looping request, the current iteration's). Variables, other requests' responses, loop variables and filters work as everywhere else.
-- OPERATOR is `==`, `!=`, `contains`, `!contains`, `<`, `<=`, `>`, `>=`, `exists` or `!exists`.
+- OPERATOR is `==`, `!=`, `in`, `!in`, `contains`, `!contains`, `<`, `<=`, `>`, `>=`, `exists` or `!exists`.
+- `in` and `!in` take a comma-separated list, each value quoted or bare and possibly `{{...}}`: `status in 200, 404`, `{{response.body.$.state}} !in "deleted", "failed"`. Commas inside quotes or `{{...}}` do not split the list.
 - EXPECTED is the rest of the line: a double-quoted string (`\"` and `\\` escapes) or bare text such as `200`, `true` or `{{wc.id}}`. `exists` and `!exists` take none.
 
 Values are compared as text, as they would be inserted in a request (strings unquoted, other JSON values as compact JSON); `<`, `<=`, `>` and `>=` compare numbers. `exists` passes when the value can be read and its filters succeed, and a subject that cannot be read fails every operator except `!exists`.
@@ -184,6 +253,7 @@ Values are compared as text, as they would be inserted in a request (strings unq
 | Check | Passes when |
 |---|---|
 | `# @assert status < 400` | the status code is below 400 |
+| `# @assert status in 200, 404` | the status code is 200 or 404 |
 | `# @assert {{response.body.$.error}} !exists` | the body has no `error` field |
 | `# @assert {{response.body.$.data.id}} == "{{wc.id}}"` | the id matches the current loop element |
 | `# @assert {{response.body.$.count}} >= 1` | `count` is a number of at least 1 |

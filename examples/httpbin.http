@@ -9,6 +9,11 @@
 #   axon-cli -f examples/httpbin.http -n "basic auth" --netrc-file examples/netrc
 #   axon-cli -f examples/httpbin.http -n "show item"         # runs "create item" first
 #   axon-cli -f examples/httpbin.http -n "each slide"        # runs "slides" first, then once per slide
+#   axon-cli -f examples/httpbin.http -n "team members"      # nested loops: each member of each team
+#   axon-cli -f examples/httpbin.http -n "slide x team"      # every slide with every team
+#   axon-cli -f examples/httpbin.http -n "member details"    # loops over each "team details" response
+#   axon-cli -f examples/httpbin.http -n "checked slides"    # @let, @skip-if and checks
+#   axon-cli -f examples/httpbin.http -n teapot --strict     # checks and exit codes
 #   HTTPBIN_TOKEN=s3cret axon-cli -f examples/httpbin.http -n bearer
 #   axon-cli -f examples/httpbin.http -n environment -b | jq .headers
 
@@ -51,6 +56,63 @@ GET {{base}}/json
 # @foreach slide in {{slides.response.body.$.slideshow.slides}}
 GET {{base}}/anything/slides/{{slide.type}}
 X-Slide-Title: {{slide.title}}
+
+### teams
+# httpbin echoes the posted JSON back as "json", so this gives lists to loop over.
+POST {{base}}/anything/teams
+Content-Type: application/json
+
+{"teams": [{"name": "core", "members": ["ann", "bob"]}, {"name": "web", "members": ["eve"]}]}
+
+### team members
+# Nested loops: several @foreach lines nest, the first outermost. A later one
+# can loop over a value inside an earlier loop variable: ann, bob, then eve.
+# @foreach team in {{teams.response.body.$.json.teams}}
+# @foreach member in {{team.members}}
+GET {{base}}/anything/teams/{{team.name}}/{{member}}
+
+### slide x team
+# Nested loops over two different responses: every slide with every team
+# (2 slides x 2 teams = 4 requests). With --json, each iteration has
+# "loop": {"slide": 0, "team": 1}.
+# @foreach slide in {{slides.response.body.$.slideshow.slides}}
+# @foreach team in {{teams.response.body.$.json.teams}}
+GET {{base}}/anything/{{slide.type}}/{{team.name}}
+
+### team details
+# @foreach team in {{teams.response.body.$.json.teams}}
+POST {{base}}/anything/teams/{{team.name}}
+Content-Type: application/json
+
+{"members": {{team.members}}}
+
+### member details
+# Following a loop: this references the looping "team details", so it runs
+# once per iteration of it, reading that iteration's response, with {{team}}
+# still that iteration's team. Its own @foreach then loops over the members
+# in that response.
+# @foreach member in {{team details.response.body.$.json.members}}
+GET {{base}}/anything/teams/{{team.name}}/members/{{member}}
+
+### checked slides
+# `@let` defines a variable for this request only, evaluated per iteration.
+# `@skip-if` skips the iterations where its check is true, like `continue`:
+# the first slide ("Wake up to WonderWidgets!") is not sent.
+# Checks then run on each response sent:
+#   `@assert`  fails the run (exit 1)      `@fail-if`    the same, when true
+#   `@warn`    reported, exit 0 (exit 1    `@warn-if`    the same, when true
+#              with --strict)
+#   `@notice`  reported, never fails       `@notice-if`  the same, when true
+# (A comment line starting with "# @let", "# @assert", ... is a directive.)
+# @foreach slide in {{slides.response.body.$.slideshow.slides}}
+# @let kind = {{slide.type}}-{{slide.title | split(" ", 0)}}
+# @skip-if {{slide.title}} contains "Wake"
+# @assert status in 200, 201
+# @assert {{response.body.$.headers['X-Kind']}} == "{{kind}}"
+# @warn {{response.headers.Content-Type}} contains "json"
+# @notice-if {{slide.items}} !exists
+GET {{base}}/anything/slides/{{slide.type}}
+X-Kind: {{kind}}
 
 ### bearer
 # Token from the environment, through @token:
@@ -135,7 +197,12 @@ X-Year: {{upload.response.body.$['X-File'] | split("-", 1)}}
 GET {{base}}/redirect/2
 
 ### teapot
-# 4xx/5xx still exit 0; check .status.code.
+# 4xx/5xx still exit 0 unless a check fails. This one passes, and prints
+#   NOTICE request "teapot": if status == 418: matched "418"
+# and with --strict it also fails the @warn (exit 1).
+# @assert status in 200, 418
+# @notice-if status == 418
+# @warn status < 400
 GET {{base}}/status/418
 
 ### html
