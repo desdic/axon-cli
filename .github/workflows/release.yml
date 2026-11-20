@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and release, e.g. v1.0.0'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  arch:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Install build tools
+        run: pacman -Syu --noconfirm rust git
+
+      - name: Check tag
+        shell: bash
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "not a vX.Y.Z tag: $TAG" >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.TAG }}
+
+      - name: Build package
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          VERSION=${TAG#v}
+          # The source tarball the PKGBUILD expects, made from the tag; makepkg
+          # uses it instead of downloading. vendor/ and .cargo/config.toml are
+          # in git, so the build works offline.
+          git archive --format=tar.gz --prefix=axon-cli-$VERSION/ -o pkg/arch/axon-cli-$VERSION.tar.gz HEAD
+          # makepkg refuses to run as root
+          useradd -m builder
+          chown -R builder pkg/arch
+          su builder -c 'cd pkg/arch && makepkg --noconfirm'
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          files: pkg/arch/axon-cli-[0-9]*-x86_64.pkg.tar.zst
+          generate_release_notes: true
