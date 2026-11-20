@@ -5,7 +5,10 @@ PLATFORMS  := *-unknown-linux-gnu *-unknown-linux-musl
 
 OFFLINE    := --frozen --offline
 
-.PHONY: all build release test clippy fmt vendor clean distclean
+AUR_DIR    ?= ../aur-axon-cli
+AUR_REPO   := ssh://aur@aur.archlinux.org/axon-cli.git
+
+.PHONY: all build release test clippy fmt vendor clean distclean aur
 
 all: build
 
@@ -34,6 +37,15 @@ vendor:
 
 $(CARGO_CFG):
 	$(MAKE) vendor
+
+aur:
+	cd pkg/arch && updpkgsums
+	test -d $(AUR_DIR) || git -c init.defaultBranch=master clone $(AUR_REPO) $(AUR_DIR)
+	cp pkg/arch/PKGBUILD $(AUR_DIR)/PKGBUILD
+	cd $(AUR_DIR) && makepkg --printsrcinfo > .SRCINFO
+	git -C $(AUR_DIR) add PKGBUILD .SRCINFO
+	git -C $(AUR_DIR) status --short
+	@echo "Review, then: git -C $(AUR_DIR) commit -m 'axon-cli <version>' && git -C $(AUR_DIR) push origin master"
 
 clean:
 	$(CARGO) clean
