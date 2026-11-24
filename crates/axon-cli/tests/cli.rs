@@ -1835,3 +1835,61 @@ fn imported_requests_run_and_list() {
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert_eq!(r.echo("x_test"), json!(["ann"]));
 }
+
+#[test]
+fn file_variables_are_relative_to_the_file_they_are_written_in() {
+    let base = start_server();
+    let dir = temp_dir("file-variables");
+    std::fs::create_dir_all(dir.join("shared")).unwrap();
+    std::fs::write(dir.join("shared/token.txt"), "abc123\n").unwrap();
+    std::fs::write(dir.join("body.json"), "{\"k\": 1}\n").unwrap();
+    std::fs::write(
+        dir.join("shared/common.http"),
+        "@token = {{$file token.txt}}\n",
+    )
+    .unwrap();
+    let main = dir.join("main.http");
+    std::fs::write(
+        &main,
+        format!(
+            "import shared/common.http\n\n### r\nPOST {base}/json\nX-Test: {{{{token}}}}\n\n{{{{$file body.json}}}}\n"
+        ),
+    )
+    .unwrap();
+
+    let r = run_in(
+        &temp_dir("empty-home"),
+        &["-f", main.to_str().unwrap(), "-n", "r"],
+        &[],
+    );
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.echo("x_test"), json!(["abc123"]));
+    assert_eq!(r.echo("body"), "{\"k\": 1}");
+}
+
+#[test]
+fn missing_file_variable_is_reported_before_sending() {
+    let r = run_request(
+        "missing-file-var",
+        "GET http://127.0.0.1:1/{{$file nope.txt}}",
+    );
+    assert_eq!(r.code, 1);
+    let error = r.stderr["error"].as_str().unwrap();
+    assert!(error.contains("nope.txt"), "{error}");
+}
+
+#[test]
+fn file_variable_expands_tilde_to_home() {
+    let base = start_server();
+    let home = temp_dir("file-var-home");
+    std::fs::create_dir_all(home.join(".ssh")).unwrap();
+    std::fs::write(home.join(".ssh/id_test.pub"), "ssh-ed25519 AAAA test\n").unwrap();
+    let file = http_file(
+        "file-var-tilde",
+        &format!("### r\nGET {base}/json\nX-Test: {{{{$file ~/.ssh/id_test.pub}}}}\n"),
+    );
+
+    let r = run_in(&home, &["-f", &file, "-n", "r"], &[]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.echo("x_test"), json!(["ssh-ed25519 AAAA test"]));
+}
