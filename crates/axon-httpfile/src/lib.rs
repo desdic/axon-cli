@@ -4,10 +4,12 @@
 //! `{{NAME.response.body.$.path}}` / `{{NAME.response.headers.Header}}` /
 //! `{{NAME.response.cookies.Cookie}}`, filters such as
 //! `{{value | split("/", -1) | trim}}`, loops with `# @foreach VAR in {{NAME.response.body.$.path}}`,
-//! and response checks with `# @assert`, `# @warn` and `# @notice`.
+//! response checks with `# @assert`, `# @warn` and `# @notice`, and
+//! `# @delay DURATION` pauses after a request.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -44,6 +46,9 @@ pub struct Request {
     pub skips: Vec<Check>,
     /// `# @let NAME = VALUE` request-local variables, in the order written.
     pub lets: Vec<Let>,
+    /// `# @delay DURATION`: how long to wait after each response before the
+    /// next request is sent, unsubstituted (see [`HttpFile::delay`]).
+    pub delay: Option<String>,
     /// 1-based lines of the request's block: from its `###` separator (or the
     /// start of the file) up to the line before the next separator.
     pub start_line: usize,
@@ -1142,6 +1147,7 @@ impl HttpFile {
         let mut checks = Vec::new();
         let mut lets = Vec::new();
         let mut skips = Vec::new();
+        let mut delay = None;
 
         // Variables, comments, `# @name`, `# @foreach` and checks, up to the
         // request line.
@@ -1166,6 +1172,12 @@ impl HttpFile {
                 checks.push(check.with_context(|| format!("line {line_no}"))?);
             } else if let Some(skip) = skip_directive(line) {
                 skips.push(skip.with_context(|| format!("line {line_no}"))?);
+            } else if let Some(text) = delay_directive(line) {
+                let text = text.with_context(|| format!("line {line_no}"))?;
+                if delay.is_some() {
+                    bail!("line {line_no}: @delay is given twice");
+                }
+                delay = Some(text);
             } else if let Some(directive) = let_directive(line) {
                 let directive = directive.with_context(|| format!("line {line_no}"))?;
                 if lets.iter().any(|l: &Let| l.name == directive.name) {
@@ -1229,6 +1241,8 @@ impl HttpFile {
                 bail!("line {line_no}: @let must come before the request line");
             } else if skip_directive(line).is_some() {
                 bail!("line {line_no}: @skip-if must come before the request line");
+            } else if delay_directive(line).is_some() {
+                bail!("line {line_no}: @delay must come before the request line");
             } else if let Some((keyword, _)) = check_directive(line) {
                 bail!(
                     "line {line_no}: @{} must come before the request line",
@@ -1257,6 +1271,7 @@ impl HttpFile {
             checks,
             skips,
             lets,
+            delay,
             start_line,
             end_line,
         });
@@ -1319,6 +1334,32 @@ impl HttpFile {
             }
         }
         Ok(false)
+    }
+
+    /// How long to wait after this iteration's response before sending the
+    /// next request: the request's `@delay`, or `None` without one.
+    pub fn delay(&self, request: &Request, ctx: &Iteration) -> Result<Option<Duration>> {
+        let Some(text) = &request.delay else {
+            return Ok(None);
+        };
+        let items = ctx.items();
+        let scope = Scope {
+            file: &request.file,
+            items: &items,
+            ..Scope::default()
+        };
+        let mut on_reference = |reference: &Reference| -> Result<Option<String>> {
+            reference.extract(ctx.response(&reference.name)?).map(Some)
+        };
+        let lets = self.let_values(request, scope, &mut on_reference)?;
+        let scope = Scope {
+            lets: &lets,
+            ..scope
+        };
+        self.substitute(text, None, scope, &mut on_reference)
+            .and_then(|value| parse_duration(&value.unwrap_or_default()))
+            .map(Some)
+            .with_context(|| format!("@delay {text}"))
     }
 
     /// The request's `@let` variables, in order, each seeing the earlier ones.
@@ -1399,6 +1440,13 @@ impl HttpFile {
                 );
             }
         }
+        if let Some(text) = &request.delay
+            && uses_own_response(text)
+        {
+            bail!(
+                "@delay {text}: cannot read {{{{response...}}}}; use a reference to a request by name"
+            );
+        }
         for each in &request.lets {
             let name = each.name.as_str();
             if self.is_variable(name) {
@@ -1467,6 +1515,10 @@ impl HttpFile {
                 self.substitute(text, None, scope, &mut collect)
                     .with_context(|| format!("{} {}", skip.directive(), skip.text))?;
             }
+        }
+        if let Some(text) = &request.delay {
+            self.substitute(text, None, scope, &mut collect)
+                .with_context(|| format!("@delay {text}"))?;
         }
         Ok(found)
     }
@@ -1610,6 +1662,7 @@ impl HttpFile {
             checks: request.checks.clone(),
             skips: request.skips.clone(),
             lets: request.lets.clone(),
+            delay: request.delay.clone(),
             start_line: request.start_line,
             end_line: request.end_line,
         })
@@ -1887,6 +1940,50 @@ fn skip_directive(line: &str) -> Option<Result<Check>> {
     Some(parse_check("skip-if", Level::Notice, true, rest.trim()))
 }
 
+/// The text of a `# @delay DURATION` or `// @delay ...` line, checked now
+/// unless it uses `{{...}}`, or `None` when the line is not a `@delay`.
+fn delay_directive(line: &str) -> Option<Result<String>> {
+    let rest = line.strip_prefix('#').or_else(|| line.strip_prefix("//"))?;
+    let rest = rest.trim_start().strip_prefix("@delay")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let text = rest.trim();
+    Some(if text.is_empty() {
+        Err(anyhow::anyhow!(
+            "@delay needs a duration, e.g. 500ms, 2s or 1m"
+        ))
+    } else if text.contains("{{") {
+        Ok(text.to_string())
+    } else {
+        parse_duration(text)
+            .map(|_| text.to_string())
+            .with_context(|| format!("@delay {text}"))
+    })
+}
+
+/// A duration such as `500ms`, `1.5s` or `2m`; a plain number is in
+/// milliseconds.
+pub fn parse_duration(text: &str) -> Result<Duration> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(text.len());
+    let (number, unit) = (&text[..split], text[split..].trim());
+    let scale = match unit {
+        "" | "ms" => 0.001,
+        "s" => 1.0,
+        "m" => 60.0,
+        _ => bail!("invalid duration (expected e.g. 500ms, 2s or 1m): {text}"),
+    };
+    number
+        .parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite())
+        .and_then(|n| Duration::try_from_secs_f64(n * scale).ok())
+        .with_context(|| format!("invalid duration (expected e.g. 500ms, 2s or 1m): {text}"))
+}
+
 /// Whether a `{{...}}` in `text` reads `response...`, the checked request's
 /// own response.
 fn uses_own_response(text: &str) -> bool {
@@ -1960,6 +2057,7 @@ mod tests {
             checks: Vec::new(),
             skips: Vec::new(),
             lets: Vec::new(),
+            delay: None,
             start_line,
             end_line,
         }
@@ -2827,6 +2925,96 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "@let variable \"h\" has the same name as a file variable"
+        );
+    }
+
+    #[test]
+    fn parses_durations() {
+        for (text, ms) in [
+            ("0", 0),
+            ("250", 250),
+            ("250ms", 250),
+            ("2s", 2000),
+            ("1.5s", 1500),
+            ("2 s", 2000),
+            ("1m", 60_000),
+        ] {
+            assert_eq!(
+                parse_duration(text).unwrap(),
+                Duration::from_millis(ms),
+                "{text}"
+            );
+        }
+        for text in ["", "s", "-1s", "1h", "1.2.3s", "abc"] {
+            assert_eq!(
+                parse_duration(text).unwrap_err().to_string(),
+                format!("invalid duration (expected e.g. 500ms, 2s or 1m): {text}"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn delay_directive() {
+        let file = parse("@wait = 2s\n# @delay 500ms\nGET http://a\n\n###\n# @foreach x in {{r.response.body.$.items}}\n# @let w = {{x.ms}}\n// @delay {{w}}\nGET http://b\n\n###\n# @delay {{wait}}\nGET http://c\n\n###\nGET http://d\n").unwrap();
+        let none = HashMap::new();
+        let delay = |index: usize, vars: &[Binding]| {
+            file.delay(&file.requests[index], &at(&none, vars))
+                .map_err(|e| format!("{e:#}"))
+        };
+        assert_eq!(delay(0, &[]), Ok(Some(Duration::from_millis(500))));
+        let element = serde_json::json!({"ms": "1s"});
+        assert_eq!(
+            delay(1, &bind("x", &element)),
+            Ok(Some(Duration::from_secs(1)))
+        );
+        let element = serde_json::json!({"ms": "soon"});
+        assert_eq!(
+            delay(1, &bind("x", &element)),
+            Err("@delay {{w}}: invalid duration (expected e.g. 500ms, 2s or 1m): soon".into())
+        );
+        assert_eq!(delay(2, &[]), Ok(Some(Duration::from_secs(2))));
+        assert_eq!(delay(3, &[]), Ok(None));
+
+        for (contents, expected) in [
+            (
+                "# @delay\nGET http://a\n",
+                "line 1: @delay needs a duration, e.g. 500ms, 2s or 1m",
+            ),
+            (
+                "# @delay soon\nGET http://a\n",
+                "line 1: @delay soon: invalid duration (expected e.g. 500ms, 2s or 1m): soon",
+            ),
+            (
+                "# @delay 1s\n# @delay 2s\nGET http://a\n",
+                "line 2: @delay is given twice",
+            ),
+            (
+                "GET http://a\n# @delay 1s\n",
+                "line 2: @delay must come before the request line",
+            ),
+        ] {
+            let err = parse(contents).err().unwrap();
+            assert_eq!(format!("{err:#}"), expected, "{contents}");
+        }
+
+        // Its references are checked, and dependencies, like the request's.
+        let file = parse("# @delay {{nope}}\nGET http://a\n").unwrap();
+        assert_eq!(
+            format!("{:#}", file.references(&file.requests[0], &[]).unwrap_err()),
+            "@delay {{nope}}: undefined variable: nope"
+        );
+        let file = parse("### a\nGET http://a\n\n###\n# @delay {{a.response.headers.Retry-After}}s\nGET http://b\n").unwrap();
+        assert_eq!(
+            file.references(&file.requests[1], &[]).unwrap(),
+            [Reference::parse("a.response.headers.Retry-After")
+                .unwrap()
+                .unwrap()]
+        );
+        let file = parse("# @delay {{response.headers.Retry-After}}s\nGET http://a\n").unwrap();
+        assert_eq!(
+            format!("{:#}", file.references(&file.requests[0], &[]).unwrap_err()),
+            "@delay {{response.headers.Retry-After}}s: cannot read {{response...}}; use a reference to a request by name"
         );
     }
 

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use axon_httpfile as httpfile;
@@ -41,6 +41,12 @@ struct Args {
     /// and its imports; VALUE is used as given, without `{{...}}` substitution
     #[arg(long = "var", value_name = "NAME=VALUE", value_parser = parse_var)]
     vars: Vec<(String, String)>,
+
+    /// Wait this long after each response before sending the next request,
+    /// e.g. 500ms, 2s or 1m (a plain number is milliseconds); a request's
+    /// `@delay` replaces it
+    #[arg(long, value_name = "DURATION", value_parser = httpfile::parse_duration)]
+    delay: Option<Duration>,
 
     /// netrc file to read credentials from [default: ~/.netrc]
     #[arg(long, value_name = "PATH")]
@@ -195,6 +201,9 @@ fn run(args: Args) -> Result<(Output, Option<String>)> {
     let mut failed = HashSet::new();
     let mut failed_checks = 0;
     let mut skipped = 0;
+    // The `@delay` (or --delay) of the last request sent, waited out only
+    // when another request is sent, so nothing waits after the last one.
+    let mut pending: Option<Duration> = None;
     for mut step in steps {
         let label = format!("request \"{}\"", step.label);
         if let Some(dependency) = step.depends_on.iter().find(|d| failed.contains(*d)) {
@@ -265,6 +274,9 @@ fn run(args: Args) -> Result<(Output, Option<String>)> {
                         .and_then(|request| build(&client, request, netrc.as_deref()))
                         .with_context(label)?,
                 };
+                if let Some(delay) = pending.take() {
+                    std::thread::sleep(delay);
+                }
                 let received = builder
                     .send()
                     .map_err(anyhow::Error::from)
@@ -327,6 +339,10 @@ fn run(args: Args) -> Result<(Output, Option<String>)> {
                     }
                 }
                 step_failed |= iteration_failed;
+                pending = file
+                    .delay(step.request, &ctx)
+                    .with_context(label)?
+                    .or(args.delay);
 
                 // A looping request's iterations are kept for the requests
                 // that follow it; any other response by name.

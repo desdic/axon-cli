@@ -653,6 +653,57 @@ fn var_option_replaces_file_variables() {
     );
 }
 
+// --- delays ----------------------------------------------------------------
+
+/// Runs `run` and returns how long it took.
+fn timed(run: impl FnOnce() -> Run) -> (Run, std::time::Duration) {
+    let start = std::time::Instant::now();
+    let r = run();
+    (r, start.elapsed())
+}
+
+#[test]
+fn delay_option_waits_between_requests() {
+    let base = start_server();
+    // `list` runs as a dependency, then `each` twice: two waits.
+    let (r, elapsed) = timed(|| {
+        run_file(
+            "delay-option",
+            &loops(&base),
+            &["-n", "each", "--delay", "300ms"],
+        )
+    });
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(elapsed.as_millis() >= 600, "{elapsed:?}");
+}
+
+#[test]
+fn delay_directive_waits_after_each_iteration_but_not_the_last_request() {
+    let base = start_server();
+    let contents = format!(
+        "### list\nGET {base}/list\n\n### each\n# @foreach user in {{{{list.response.body.$.users}}}}\n# @delay 1s\nGET {base}/json\n"
+    );
+    let (r, elapsed) = timed(|| run_file("delay-directive", &contents, &["-n", "each"]));
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    // Between the two iterations only, not after the second.
+    assert!((1000..1900).contains(&elapsed.as_millis()), "{elapsed:?}");
+}
+
+#[test]
+fn delay_directive_replaces_delay_option() {
+    let base = start_server();
+    let contents = format!("### a\n# @delay 0\nGET {base}/json\n\n### b\nGET {base}/json\n");
+    let (r, elapsed) = timed(|| {
+        run_file(
+            "delay-zero",
+            &contents,
+            &["-n", "a", "-n", "b", "--delay", "5s"],
+        )
+    });
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(elapsed.as_millis() < 3000, "{elapsed:?}");
+}
+
 // --- selecting requests ----------------------------------------------------
 
 #[test]
