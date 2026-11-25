@@ -37,6 +37,11 @@ struct Args {
     #[arg(short, long, conflicts_with = "names")]
     list: bool,
 
+    /// Set a variable (repeatable), replacing any `@NAME = ...` in the file
+    /// and its imports; VALUE is used as given, without `{{...}}` substitution
+    #[arg(long = "var", value_name = "NAME=VALUE", value_parser = parse_var)]
+    vars: Vec<(String, String)>,
+
     /// netrc file to read credentials from [default: ~/.netrc]
     #[arg(long, value_name = "PATH")]
     netrc_file: Option<PathBuf>,
@@ -63,6 +68,13 @@ struct Args {
     /// Treat a failed `@warn` check like a failed `@assert`
     #[arg(long)]
     strict: bool,
+}
+
+/// Splits a `--var NAME=VALUE` at its first `=`.
+fn parse_var(arg: &str) -> std::result::Result<(String, String), String> {
+    arg.split_once('=')
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .ok_or_else(|| format!("expected NAME=VALUE, got \"{arg}\""))
 }
 
 enum Output {
@@ -99,7 +111,10 @@ fn main() -> ExitCode {
 /// summary such as `2 checks failed, 1 request skipped`.
 fn run(args: Args) -> Result<(Output, Option<String>)> {
     let path = &args.file;
-    let file = httpfile::parse_file(path)?;
+    let mut file = httpfile::parse_file(path)?;
+    for (name, value) in &args.vars {
+        file.set_variable(name, value).context("--var")?;
+    }
 
     if args.list {
         // An unnamed request is listed as the `#N` that selects it with -n.

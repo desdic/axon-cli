@@ -1,6 +1,6 @@
 //! Parser for `.http` files (JetBrains / VS Code REST Client format):
 //! `###` separators, `# @name`, `@var = value` file variables, and
-//! `{{var}}` / `{{$env NAME}}` substitution, and response chaining with
+//! `{{var}}` / `{{$env NAME}}` / `{{$file PATH}}` substitution, and response chaining with
 //! `{{NAME.response.body.$.path}}` / `{{NAME.response.headers.Header}}` /
 //! `{{NAME.response.cookies.Cookie}}`, filters such as
 //! `{{value | split("/", -1) | trim}}`, loops with `# @foreach VAR in {{NAME.response.body.$.path}}`,
@@ -14,8 +14,12 @@ use serde_json::Value;
 
 #[derive(Default)]
 pub struct HttpFile {
-    /// File variables in definition order, with their values unsubstituted.
-    variables: Vec<(String, String)>,
+    /// File variables in definition order, with their values unsubstituted
+    /// and the file they are written in (as in [`Request::file`]).
+    variables: Vec<(String, String, String)>,
+    /// Variables set with [`HttpFile::set_variable`], in the order set; their
+    /// values are literal and replace any file variable of the same name.
+    overrides: Vec<(String, String)>,
     pub requests: Vec<Request>,
 }
 
@@ -285,6 +289,9 @@ struct Item<'a> {
 /// requests' responses.
 #[derive(Clone, Copy, Default)]
 struct Scope<'a> {
+    /// The file the text is written in, which relative `{{$file PATH}}`
+    /// paths start from (empty: the current directory).
+    file: &'a str,
     /// Loop variables, outermost first.
     items: &'a [Item<'a>],
     /// In a check, the request's own response, read by `{{response...}}`
@@ -1012,6 +1019,25 @@ fn import_line(line: &str) -> Option<Result<&str>> {
 }
 
 impl HttpFile {
+    /// Sets a variable from outside the file (e.g. `--var NAME=VALUE`): it
+    /// replaces any file variable of that name everywhere, also inside other
+    /// variables and imported files, and its value is used as given, without
+    /// `{{...}}` substitution. Setting a name again replaces the earlier value.
+    pub fn set_variable(&mut self, name: &str, value: &str) -> Result<()> {
+        if !is_var_name(name) {
+            bail!("invalid variable name (use letters, digits, _ and -): {name}");
+        }
+        self.overrides.retain(|(n, _)| n != name);
+        self.overrides.push((name.to_string(), value.to_string()));
+        Ok(())
+    }
+
+    /// Whether `name` is a file variable or set with [`HttpFile::set_variable`].
+    fn is_variable(&self, name: &str) -> bool {
+        self.variables.iter().any(|(n, ..)| n == name)
+            || self.overrides.iter().any(|(n, _)| n == name)
+    }
+
     /// Parses the lines of one file, `display` naming it in errors.
     fn parse_text(&mut self, contents: &str, display: &str, imports: &mut Imports) -> Result<()> {
         let mut origin = Origin {
@@ -1157,8 +1183,11 @@ impl HttpFile {
                 let Some((var, value)) = variable.split_once('=') else {
                     bail!("line {line_no}: invalid variable (expected \"@name = value\"): {line}");
                 };
-                self.variables
-                    .push((var.trim().to_string(), value.trim().to_string()));
+                self.variables.push((
+                    var.trim().to_string(),
+                    value.trim().to_string(),
+                    origin.display.to_string(),
+                ));
             } else if let Some(path) = import_line(line) {
                 if origin.requests_seen {
                     bail!("line {line_no}: import must come before the first request");
@@ -1239,6 +1268,7 @@ impl HttpFile {
     pub fn resolve(&self, request: &Request, ctx: &Iteration) -> Result<Request> {
         let items = ctx.items();
         let scope = Scope {
+            file: &request.file,
             items: &items,
             ..Scope::default()
         };
@@ -1264,6 +1294,7 @@ impl HttpFile {
         }
         let items = ctx.items();
         let scope = Scope {
+            file: &request.file,
             items: &items,
             ..Scope::default()
         };
@@ -1338,7 +1369,7 @@ impl HttpFile {
         let mut known: Vec<&str> = inherited.iter().map(String::as_str).collect();
         for foreach in &request.foreach {
             let var = foreach.var.as_str();
-            if self.variables.iter().any(|(name, _)| name == var) {
+            if self.is_variable(var) {
                 bail!("@foreach variable \"{var}\" has the same name as a file variable");
             }
             if known.contains(&var) {
@@ -1370,7 +1401,7 @@ impl HttpFile {
         }
         for each in &request.lets {
             let name = each.name.as_str();
-            if self.variables.iter().any(|(var, _)| var == name) {
+            if self.is_variable(name) {
                 bail!("@let variable \"{name}\" has the same name as a file variable");
             }
             if known.contains(&name) {
@@ -1401,6 +1432,7 @@ impl HttpFile {
             .map(|&var| Item { var, element: None })
             .collect();
         let scope = Scope {
+            file: &request.file,
             items: &items,
             lenient,
             ..Scope::default()
@@ -1509,6 +1541,7 @@ impl HttpFile {
             reference.extract(ctx.response(&reference.name)?).map(Some)
         };
         let scope = Scope {
+            file: &request.file,
             items: &items,
             ..Scope::default()
         };
@@ -1646,16 +1679,21 @@ impl HttpFile {
         on_reference: OnReference,
     ) -> Result<Option<String>> {
         if let Some(dynamic) = name.strip_prefix('$') {
-            let Some(var) = dynamic
-                .strip_prefix("env")
-                .filter(|v| v.starts_with(char::is_whitespace))
-            else {
-                bail!("unsupported dynamic variable: {{{{{name}}}}}");
+            let argument = |keyword: &str| {
+                dynamic
+                    .strip_prefix(keyword)
+                    .filter(|v| v.starts_with(char::is_whitespace))
+                    .map(str::trim)
             };
-            let var = var.trim();
-            return std::env::var(var)
-                .map(Some)
-                .with_context(|| format!("environment variable not set: {var}"));
+            if let Some(var) = argument("env") {
+                return std::env::var(var)
+                    .map(Some)
+                    .with_context(|| format!("environment variable not set: {var}"));
+            }
+            if let Some(path) = argument("file") {
+                return read_input_file(scope.file, path).map(Some);
+            }
+            bail!("unsupported dynamic variable: {{{{{name}}}}}");
         }
         // In a check, `{{response...}}` is the request's own response.
         if let Some(own) = scope.own
@@ -1689,13 +1727,16 @@ impl HttpFile {
         if let Some(reference) = Reference::parse(name) {
             return on_reference(&reference?);
         }
+        if let Some((_, value)) = self.overrides.iter().find(|(n, _)| n == name) {
+            return Ok(Some(value.clone()));
+        }
         // A redefined variable takes its last definition (late binding),
         // except inside its own value, where it takes the one before.
         let definitions = match chain.and_then(|chain| chain.index_of(name)) {
             Some(own) => &self.variables[..own],
             None => &self.variables[..],
         };
-        let Some(index) = definitions.iter().rposition(|(n, _)| n == name) else {
+        let Some(index) = definitions.iter().rposition(|(n, ..)| n == name) else {
             if scope.lenient {
                 return Ok(None);
             }
@@ -1708,13 +1749,41 @@ impl HttpFile {
             index,
             parent: chain,
         };
+        let (_, value, file) = &self.variables[index];
         self.substitute(
-            &self.variables[index].1,
+            value,
             Some(&link),
-            Scope::default(),
+            Scope {
+                file,
+                ..Scope::default()
+            },
             on_reference,
         )
     }
+}
+
+/// The contents of the file at `path` for `{{$file PATH}}`, relative to the
+/// directory of `file` (the one it is written in) unless absolute or starting
+/// with `~/` (the home directory), without trailing newlines (like
+/// `$(cat PATH)` in a shell).
+fn read_input_file(file: &str, path: &str) -> Result<String> {
+    let home_relative = match path {
+        "~" => Some(""),
+        _ => path.strip_prefix("~/"),
+    };
+    let target = match home_relative {
+        Some(rest) => {
+            let home = std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .with_context(|| format!("cannot expand ~ in {path}: HOME is not set"))?;
+            PathBuf::from(home).join(rest)
+        }
+        None => Path::new(file).parent().unwrap_or(Path::new("")).join(path),
+    };
+    let mut contents = std::fs::read_to_string(&target)
+        .with_context(|| format!("failed to read {}", target.display()))?;
+    contents.truncate(contents.trim_end_matches(['\n', '\r']).len());
+    Ok(contents)
 }
 
 /// The file variables being substituted, innermost first: a variable used
@@ -2719,6 +2788,49 @@ mod tests {
     }
 
     #[test]
+    fn set_variables_replace_file_variables() {
+        let url = |contents: &str, vars: &[(&str, &str)]| {
+            let mut file = parse(contents).unwrap();
+            for (name, value) in vars {
+                file.set_variable(name, value)?;
+            }
+            file.resolve(&file.requests[0], &at(&HashMap::new(), &[]))
+                .map(|r| r.url)
+        };
+        let contents = "@host = a\n@base = http://{{host}}\nGET {{base}}/x\n";
+        assert_eq!(url(contents, &[]).unwrap(), "http://a/x");
+        // Also inside other variables, and the last value set wins.
+        assert_eq!(
+            url(contents, &[("host", "b"), ("host", "c")]).unwrap(),
+            "http://c/x"
+        );
+        assert_eq!(
+            url(contents, &[("base", "http://d")]).unwrap(),
+            "http://d/x"
+        );
+        // Defines a variable the file does not, and is used literally.
+        assert_eq!(
+            url("GET http://{{h}}/x\n", &[("h", "{{host}}")]).unwrap(),
+            "http://{{host}}/x"
+        );
+        assert_eq!(
+            url("GET http://a\n", &[("a.b", "1")])
+                .unwrap_err()
+                .to_string(),
+            "invalid variable name (use letters, digits, _ and -): a.b"
+        );
+        // @let and @foreach names cannot clash with it, as with file variables.
+        let mut file = parse("# @let h = 1\nGET http://a/{{h}}\n").unwrap();
+        file.set_variable("h", "2").unwrap();
+        assert_eq!(
+            file.references(&file.requests[0], &[])
+                .unwrap_err()
+                .to_string(),
+            "@let variable \"h\" has the same name as a file variable"
+        );
+    }
+
+    #[test]
     fn variables_reference_earlier_variables() {
         let r = resolved("@host = example.com\n@base = https://{{host}}/api\nGET {{base}}/items\n")
             .unwrap();
@@ -2779,6 +2891,33 @@ mod tests {
         let path = std::env::var("PATH").unwrap();
         let r = resolved("GET http://a/?p={{$env PATH}}\n").unwrap();
         assert_eq!(r.url, format!("http://a/?p={path}"));
+    }
+
+    #[test]
+    fn file_variable() {
+        let dir = std::env::temp_dir().join(format!("axon-file-var-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = dir.join("token");
+        std::fs::write(&token, "s3cr3t\n\n").unwrap();
+        let body = dir.join("body.json");
+        std::fs::write(&body, "{\n  \"k\": 1\n}\n").unwrap();
+        let r = resolved(&format!(
+            "@token = {{{{$file {}}}}}\nPOST http://a/\nAuthorization: Bearer {{{{token}}}}\n\n{{{{$file {} | trim}}}}\n",
+            token.display(),
+            body.display()
+        ))
+        .unwrap();
+        assert_eq!(r.headers[0].1, "Bearer s3cr3t");
+        assert_eq!(r.body.as_deref(), Some("{\n  \"k\": 1\n}"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn missing_file_variable() {
+        let err = resolved("GET http://a/{{$file /axon-cli/surely/missing}}\n")
+            .err()
+            .unwrap();
+        assert_eq!(err.to_string(), "failed to read /axon-cli/surely/missing");
     }
 
     #[test]

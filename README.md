@@ -23,6 +23,7 @@ axon-cli -f <FILE> -n <NAME> --json       # print the full responses as JSON
 | `-f, --file FILE` | `.http` file to read requests from |
 | `-n, --name NAME` | Request to run (repeatable): its name, or `#N` for the Nth request in the file (1-based, unnamed ones included); quote names with spaces: `-n "create item"` |
 | `-l, --list` | Print only the request names, as a JSON array of strings; an unnamed request is listed as its `#N` |
+| `--var NAME=VALUE` | Set a variable (repeatable), replacing any `@NAME = ...` in the file and its imports (see [Variables](#variables)) |
 | `--netrc-file PATH` | netrc file to read credentials from (default `~/.netrc`) |
 | `--no-follow` | Do not follow redirects |
 | `-j, --json` | Print each `-n` response as JSON (status, headers, cookies, body) instead of the headers and raw body |
@@ -34,7 +35,7 @@ Credentials come from `.netrc` unless the request has an `Authorization` header 
 
 ### Variables
 
-File variables (`@name = value`) and environment variables (`{{$env NAME}}`) can be used in the URL, headers and body:
+File variables (`@name = value`), environment variables (`{{$env NAME}}`) and file contents (`{{$file PATH}}`) can be used in the URL, headers and body:
 
 ```http
 @base = https://{{$env API_HOST}}/v1
@@ -64,8 +65,28 @@ axon-cli -f api.http -n "create item" -b | jq .id
 
 - A variable may use other variables, so `@base` can be built from `{{$env API_HOST}}` and used everywhere; switching environments only means changing the environment variable.
 - A variable defined more than once takes its last definition everywhere, also inside other variables: with `@base = a`, `@api = {{base}}/v3`, `@base = b`, `{{api}}` is `b/v3`. A variable used in its own value takes the definition before it: `@path = {{path}}/more`.
+- `--var NAME=VALUE` on the command line replaces the file variable `NAME` everywhere, also inside other variables and imported files, or defines it if the file does not: `axon-cli -f api.http -n list --var base=https://staging/v1`. The value is used as given (no `{{...}}` substitution); it is split at the first `=`, and the last `--var` for a name wins. Like a file variable, it cannot share a name with an `@let` or `@foreach` variable.
 - Keep secrets out of the `.http` file with `{{$env ...}}` (or use `.netrc`, see above).
 - An undefined file variable or unset environment variable is an error (exit 1), reported before any request is sent, for the requests being run only.
+
+#### Reading files
+
+`{{$file PATH}}` inserts the contents of a file, e.g. a token or a request body kept next to the `.http` file:
+
+```http
+@token = {{$file secrets/token.txt}}
+
+### create item
+POST https://api.example.com/items
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{{$file payloads/item.json}}
+```
+
+- PATH is relative to the directory of the `.http` file it is written in (as for `import`), absolute, or in the home directory with `~/` (`{{$file ~/.ssh/id_ed25519.pub}}`, using `$HOME`; `~user` is not supported); inside an imported file it is relative to that file, also when the variable is used from the importing file. Everything after `$file ` is the path, trimmed, so it is not quoted.
+- Trailing newlines are removed (like `$(cat PATH)` in a shell), so a token file ending in a newline works in a header; use filters for anything else (`{{$file name.txt | trim}}`).
+- The file must be UTF-8 text. A missing or unreadable file is an error (exit 1), reported before any request is sent, for the requests being run only.
 
 ### Imports
 
