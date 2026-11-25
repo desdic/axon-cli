@@ -17,6 +17,9 @@ pub struct HttpFile {
     /// File variables in definition order, with their values unsubstituted
     /// and the file they are written in (as in [`Request::file`]).
     variables: Vec<(String, String, String)>,
+    /// Variables set with [`HttpFile::set_variable`], in the order set; their
+    /// values are literal and replace any file variable of the same name.
+    overrides: Vec<(String, String)>,
     pub requests: Vec<Request>,
 }
 
@@ -1016,6 +1019,25 @@ fn import_line(line: &str) -> Option<Result<&str>> {
 }
 
 impl HttpFile {
+    /// Sets a variable from outside the file (e.g. `--var NAME=VALUE`): it
+    /// replaces any file variable of that name everywhere, also inside other
+    /// variables and imported files, and its value is used as given, without
+    /// `{{...}}` substitution. Setting a name again replaces the earlier value.
+    pub fn set_variable(&mut self, name: &str, value: &str) -> Result<()> {
+        if !is_var_name(name) {
+            bail!("invalid variable name (use letters, digits, _ and -): {name}");
+        }
+        self.overrides.retain(|(n, _)| n != name);
+        self.overrides.push((name.to_string(), value.to_string()));
+        Ok(())
+    }
+
+    /// Whether `name` is a file variable or set with [`HttpFile::set_variable`].
+    fn is_variable(&self, name: &str) -> bool {
+        self.variables.iter().any(|(n, ..)| n == name)
+            || self.overrides.iter().any(|(n, _)| n == name)
+    }
+
     /// Parses the lines of one file, `display` naming it in errors.
     fn parse_text(&mut self, contents: &str, display: &str, imports: &mut Imports) -> Result<()> {
         let mut origin = Origin {
@@ -1347,7 +1369,7 @@ impl HttpFile {
         let mut known: Vec<&str> = inherited.iter().map(String::as_str).collect();
         for foreach in &request.foreach {
             let var = foreach.var.as_str();
-            if self.variables.iter().any(|(name, ..)| name == var) {
+            if self.is_variable(var) {
                 bail!("@foreach variable \"{var}\" has the same name as a file variable");
             }
             if known.contains(&var) {
@@ -1379,7 +1401,7 @@ impl HttpFile {
         }
         for each in &request.lets {
             let name = each.name.as_str();
-            if self.variables.iter().any(|(var, ..)| var == name) {
+            if self.is_variable(name) {
                 bail!("@let variable \"{name}\" has the same name as a file variable");
             }
             if known.contains(&name) {
@@ -1704,6 +1726,9 @@ impl HttpFile {
         }
         if let Some(reference) = Reference::parse(name) {
             return on_reference(&reference?);
+        }
+        if let Some((_, value)) = self.overrides.iter().find(|(n, _)| n == name) {
+            return Ok(Some(value.clone()));
         }
         // A redefined variable takes its last definition (late binding),
         // except inside its own value, where it takes the one before.
@@ -2760,6 +2785,49 @@ mod tests {
         assert_eq!(r.url, "https://example.com/x");
         assert_eq!(r.headers, [("Authorization".into(), "Bearer t0k".into())]);
         assert_eq!(r.body.as_deref(), Some("host=example.com"));
+    }
+
+    #[test]
+    fn set_variables_replace_file_variables() {
+        let url = |contents: &str, vars: &[(&str, &str)]| {
+            let mut file = parse(contents).unwrap();
+            for (name, value) in vars {
+                file.set_variable(name, value)?;
+            }
+            file.resolve(&file.requests[0], &at(&HashMap::new(), &[]))
+                .map(|r| r.url)
+        };
+        let contents = "@host = a\n@base = http://{{host}}\nGET {{base}}/x\n";
+        assert_eq!(url(contents, &[]).unwrap(), "http://a/x");
+        // Also inside other variables, and the last value set wins.
+        assert_eq!(
+            url(contents, &[("host", "b"), ("host", "c")]).unwrap(),
+            "http://c/x"
+        );
+        assert_eq!(
+            url(contents, &[("base", "http://d")]).unwrap(),
+            "http://d/x"
+        );
+        // Defines a variable the file does not, and is used literally.
+        assert_eq!(
+            url("GET http://{{h}}/x\n", &[("h", "{{host}}")]).unwrap(),
+            "http://{{host}}/x"
+        );
+        assert_eq!(
+            url("GET http://a\n", &[("a.b", "1")])
+                .unwrap_err()
+                .to_string(),
+            "invalid variable name (use letters, digits, _ and -): a.b"
+        );
+        // @let and @foreach names cannot clash with it, as with file variables.
+        let mut file = parse("# @let h = 1\nGET http://a/{{h}}\n").unwrap();
+        file.set_variable("h", "2").unwrap();
+        assert_eq!(
+            file.references(&file.requests[0], &[])
+                .unwrap_err()
+                .to_string(),
+            "@let variable \"h\" has the same name as a file variable"
+        );
     }
 
     #[test]

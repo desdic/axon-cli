@@ -630,6 +630,29 @@ fn file_and_env_variables() {
     assert_eq!(r.echo("body"), format!("url={base}/json"));
 }
 
+#[test]
+fn var_option_replaces_file_variables() {
+    let base = start_server();
+    let contents = format!(
+        "@host = nowhere.invalid\n@url = {{{{host}}}}/json\n### r\nGET {base}/{{{{url}}}}?u={{{{user}}}}\n"
+    );
+    let r = run_file(
+        "var-option",
+        &contents,
+        &["-n", "r", "--var", "host=x", "--var", "user=a=b"],
+    );
+
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.stdout["url"], format!("{base}/x/json?u=a=b"));
+
+    let r = run_file("var-option-bad", &contents, &["-n", "r", "--var", "a.b=1"]);
+    assert_eq!(r.code, 1);
+    assert_eq!(
+        r.stderr["error"],
+        "--var: invalid variable name (use letters, digits, _ and -): a.b"
+    );
+}
+
 // --- selecting requests ----------------------------------------------------
 
 #[test]
