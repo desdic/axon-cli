@@ -30,7 +30,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ env.TAG }}
 
@@ -50,7 +50,7 @@ jobs:
           # commit that contains it; this one is made from the checkout.
           su builder -c 'cd pkg/arch && makepkg --noconfirm --skipchecksums'
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG }}
           files: pkg/arch/axon-cli-[0-9]*-x86_64.pkg.tar.zst
