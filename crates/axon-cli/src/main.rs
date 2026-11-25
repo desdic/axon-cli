@@ -467,7 +467,8 @@ struct Step<'a> {
     label: String,
     /// Given with `-n`, rather than run only as a dependency.
     selected: bool,
-    /// Uses earlier responses, so it can only be built once those arrive.
+    /// Uses earlier responses or loops, so it can only be built once those
+    /// responses arrive, or per iteration.
     chained: bool,
     /// Names of the requests whose responses it uses; it is skipped when one
     /// of them failed its checks.
@@ -568,7 +569,7 @@ impl<'a> Planner<'a> {
             request,
             label: label.to_string(),
             selected,
-            chained: !names.is_empty(),
+            chained: !names.is_empty() || looping,
             follows: follows.map(|(name, _)| name.clone()),
             looping,
             depends_on: names,

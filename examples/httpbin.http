@@ -13,6 +13,10 @@
 #   axon-cli -f examples/httpbin.http -n "slide x team"      # every slide with every team
 #   axon-cli -f examples/httpbin.http -n "member details"    # loops over each "team details" response
 #   axon-cli -f examples/httpbin.http -n "checked slides"    # @let, @skip-if and checks
+#   axon-cli -f examples/httpbin.http -n "file token"        # {{$file}} in a variable and a header
+#   axon-cli -f examples/httpbin.http -n "file body"         # request body read from a file
+#   axon-cli -f examples/httpbin.http -n "each id"           # loops over the lines of a file
+#   axon-cli -f examples/httpbin.http -n "each user role"    # loops over a JSON file, nested
 #   axon-cli -f examples/httpbin.http -n teapot --strict     # checks and exit codes
 #   HTTPBIN_TOKEN=s3cret axon-cli -f examples/httpbin.http -n bearer
 #   axon-cli -f examples/httpbin.http -n environment -b | jq .headers
@@ -23,6 +27,8 @@
 # A file variable can read the environment; it is only needed (and checked)
 # when a request that uses it runs.
 @token = {{$env HTTPBIN_TOKEN}}
+# {{$file PATH}} reads a file, relative to this one, without trailing newlines.
+@file_token = {{$file data/token.txt}}
 # Filters work in file variables too; this one is only evaluated (and
 # "upload" only sent) when a request that uses {{item_id}} runs.
 @item_id = {{upload.response.headers.Location | split("/", -1) | split("?", 0)}}
@@ -128,6 +134,34 @@ X-Lang: {{$env LANG}}
 Content-Type: application/json
 
 {"user": "{{$env USER}}", "terminal": "{{$env TERM}}"}
+
+### file token
+# The token comes from data/token.txt through @file_token; {{$file ...}} also
+# works directly in the URL, headers and body, with filters.
+GET {{base}}/bearer
+Authorization: Bearer {{file_token}}
+X-Token-Prefix: {{$file data/token.txt | split("-", 0)}}
+
+### file body
+# The whole body from a file; httpbin echoes it back as "json".
+POST {{base}}/anything/items
+Content-Type: application/json
+
+{{$file data/item.json}}
+
+### each id
+# Loops over a file: one iteration per line of data/ids.txt (101, 102, 103),
+# skipping blank lines and # comments. Nothing is sent if the file is missing.
+# @foreach id in {{$file data/ids.txt}}
+GET {{base}}/anything/items/{{id}}
+
+### each user role
+# A .json file must hold an array; its elements can be objects, and a second
+# loop can go over a value inside them: ann/admin, ann/dev, bob/dev.
+# (The loop variable is "person", since @user is already a file variable.)
+# @foreach person in {{$file data/users.json}}
+# @foreach role in {{person.roles}}
+GET {{base}}/anything/users/{{person.name}}/roles/{{role}}
 
 ### Update (renamed below)
 # @name update item

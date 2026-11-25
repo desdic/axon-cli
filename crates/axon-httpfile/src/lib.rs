@@ -3,7 +3,7 @@
 //! `{{var}}` / `{{$env NAME}}` / `{{$file PATH}}` substitution, and response chaining with
 //! `{{NAME.response.body.$.path}}` / `{{NAME.response.headers.Header}}` /
 //! `{{NAME.response.cookies.Cookie}}`, filters such as
-//! `{{value | split("/", -1) | trim}}`, loops with `# @foreach VAR in {{NAME.response.body.$.path}}`,
+//! `{{value | split("/", -1) | trim}}`, loops with `# @foreach VAR in {{NAME.response.body.$.path}}` or `{{$file PATH}}`,
 //! response checks with `# @assert`, `# @warn` and `# @notice`, and
 //! `# @delay DURATION` pauses after a request.
 
@@ -211,6 +211,9 @@ pub struct Foreach {
 enum Source {
     /// A response body reference, `{{NAME.response.body.$.path}}`.
     Response(Reference),
+    /// The lines of a file, or the elements of a JSON array in a `.json`
+    /// file: `{{$file PATH}}`, with PATH as for `{{$file PATH}}` elsewhere.
+    File(String),
     /// A value inside an earlier loop variable, `{{VAR.path}}`.
     Var {
         /// As written, for messages.
@@ -225,6 +228,7 @@ impl Source {
     fn text(&self) -> String {
         match self {
             Source::Response(reference) => reference.text(),
+            Source::File(path) => format!("$file {path}"),
             Source::Var { text, .. } => text.clone(),
         }
     }
@@ -481,7 +485,7 @@ fn json_text(value: &Value) -> String {
 fn parse_foreach(text: &str) -> Result<Foreach> {
     let invalid = || {
         anyhow::anyhow!(
-            "invalid @foreach (expected \"@foreach VAR in {{{{NAME.response.body.$.path}}}}\"): @foreach {text}"
+            "invalid @foreach (expected \"@foreach VAR in {{{{NAME.response.body.$.path}}}}\" or \"{{{{$file PATH}}}}\"): @foreach {text}"
         )
     };
     let (var, rest) = text.split_once(char::is_whitespace).ok_or_else(invalid)?;
@@ -499,8 +503,13 @@ fn parse_foreach(text: &str) -> Result<Foreach> {
     if split_pipes(source).len() > 1 {
         bail!("@foreach cannot use filters: {{{{{source}}}}}");
     }
-    let source = match Reference::parse(source) {
-        Some(reference) => {
+    let file = source
+        .strip_prefix("$file")
+        .filter(|path| path.starts_with(char::is_whitespace))
+        .map(str::trim);
+    let source = match (file, Reference::parse(source)) {
+        (Some(path), _) => Source::File(path.to_string()),
+        (None, Some(reference)) => {
             let reference = reference?;
             let kind = match reference.part {
                 Part::Body { .. } => None,
@@ -516,12 +525,12 @@ fn parse_foreach(text: &str) -> Result<Foreach> {
             }
             Source::Response(reference)
         }
-        None => {
+        (None, None) => {
             let end = source.find(['.', '[']).unwrap_or(source.len());
             let source_var = &source[..end];
             if !is_var_name(source_var) {
                 bail!(
-                    "@foreach must loop over a {{{{NAME.response.body.$.path}}}} reference or a loop variable: {{{{{source}}}}}"
+                    "@foreach must loop over a {{{{NAME.response.body.$.path}}}} reference, a {{{{$file PATH}}}} or a loop variable: {{{{{source}}}}}"
                 );
             }
             let steps = parse_path(&format!("${}", &source[end..]))
@@ -1416,6 +1425,10 @@ impl HttpFile {
             if known.contains(&var) {
                 bail!("@foreach variable \"{var}\" is already a loop variable");
             }
+            if let Source::File(path) = &foreach.source {
+                read_loop_file(&request.file, path)
+                    .with_context(|| format!("@foreach {{{{$file {path}}}}}"))?;
+            }
             if let Source::Var {
                 text,
                 var: source_var,
@@ -1535,7 +1548,7 @@ impl HttpFile {
         for foreach in &request.foreach {
             let mut next = Vec::new();
             for vars in combinations {
-                let items = match self.source_value(&foreach.source, ctx, &vars) {
+                let items = match self.source_value(&foreach.source, &request.file, ctx, &vars) {
                     Ok(Value::Array(items)) => items,
                     Ok(_) => {
                         let error = anyhow::anyhow!(
@@ -1563,9 +1576,18 @@ impl HttpFile {
 
     /// The value a `@foreach` loops over, with `own` the request's own loop
     /// variables bound so far.
-    fn source_value(&self, source: &Source, ctx: &Iteration, own: &[Binding]) -> Result<Value> {
+    fn source_value(
+        &self,
+        source: &Source,
+        file: &str,
+        ctx: &Iteration,
+        own: &[Binding],
+    ) -> Result<Value> {
         match source {
             Source::Response(reference) => reference.value(ctx.response(&reference.name)?),
+            Source::File(path) => read_loop_file(file, path)
+                .map(Value::Array)
+                .with_context(|| format!("@foreach {{{{$file {path}}}}}")),
             Source::Var { text, var, steps } => {
                 let binding = own
                     .iter()
@@ -1812,6 +1834,28 @@ impl HttpFile {
             },
             on_reference,
         )
+    }
+}
+
+/// The elements of `{{$file PATH}}` in a `@foreach`: a `.json` file's
+/// top-level array, or else each line, trimmed, without empty lines and
+/// `#` comments. PATH is found as in [`read_input_file`].
+fn read_loop_file(file: &str, path: &str) -> Result<Vec<Value>> {
+    let contents = read_input_file(file, path)?;
+    if !Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+    {
+        return Ok(contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| Value::String(line.to_string()))
+            .collect());
+    }
+    match serde_json::from_str(&contents).context("invalid JSON")? {
+        Value::Array(items) => Ok(items),
+        _ => bail!("not a JSON array"),
     }
 }
 
@@ -2316,7 +2360,7 @@ mod tests {
             ),
             (
                 "# @foreach x in {{$env LIST}}\nGET http://a\n",
-                "line 1: @foreach must loop over a {{NAME.response.body.$.path}} reference or a loop variable",
+                "line 1: @foreach must loop over a {{NAME.response.body.$.path}} reference, a {{$file PATH}} or a loop variable",
             ),
             (
                 "# @foreach x in {{list..a}}\nGET http://a\n",
@@ -3097,6 +3141,61 @@ mod tests {
         .unwrap();
         assert_eq!(r.headers[0].1, "Bearer s3cr3t");
         assert_eq!(r.body.as_deref(), Some("{\n  \"k\": 1\n}"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn foreach_over_a_file() {
+        let dir = std::env::temp_dir().join(format!("axon-foreach-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ids.txt"), "# ids\n 7 \n\n8\n").unwrap();
+        std::fs::write(
+            dir.join("users.JSON"),
+            r#"[{"name": "ann", "roles": ["a", "b"]}, {"name": "bob", "roles": []}]"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("object.json"), r#"{"a": 1}"#).unwrap();
+        std::fs::write(dir.join("bad.json"), "[1,").unwrap();
+        let http = dir.join("requests.http");
+        let iterate = |source: &str, inner: &str| {
+            let contents = format!("# @foreach x in {{{{{source}}}}}\n{inner}GET http://a/\n");
+            std::fs::write(&http, &contents).unwrap();
+            let file = parse_file(&http).unwrap();
+            let request = &file.requests[0];
+            file.references(request, &[])
+                .map_err(|e| format!("{e:#}"))?;
+            iterations(&file, request, &at(&HashMap::new(), &[]))
+        };
+        // Relative to the .http file; lines are trimmed, without blank and
+        // `#` lines; anything else is text.
+        assert_eq!(
+            iterate("$file ids.txt", ""),
+            Ok(vec![r#"x0="7""#.into(), r#"x1="8""#.into()])
+        );
+        // `.json` (any case): the elements of the array, also to nest over.
+        assert_eq!(
+            iterate("$file users.JSON", "# @foreach r in {{x.roles}}\n"),
+            Ok(vec![
+                r#"x0={"name":"ann","roles":["a","b"]} r0="a""#.into(),
+                r#"x0={"name":"ann","roles":["a","b"]} r1="b""#.into(),
+            ])
+        );
+        assert_eq!(
+            iterate("$file object.json", ""),
+            Err("@foreach {{$file object.json}}: not a JSON array".into())
+        );
+        assert!(
+            iterate("$file bad.json", "")
+                .unwrap_err()
+                .starts_with("@foreach {{$file bad.json}}: invalid JSON: "),
+        );
+        assert_eq!(
+            iterate("$file nope.txt", ""),
+            Err(format!(
+                "@foreach {{{{$file nope.txt}}}}: failed to read {}: No such file or directory (os error 2)",
+                dir.join("nope.txt").display()
+            ))
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
