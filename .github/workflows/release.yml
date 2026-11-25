@@ -45,7 +45,10 @@ jobs:
           # makepkg refuses to run as root
           useradd -m builder
           chown -R builder pkg/arch
-          su builder -c 'cd pkg/arch && makepkg --noconfirm'
+          # The PKGBUILD's sha256sums is for the GitHub tag tarball (set by
+          # `make aur` after tagging), so it can never match a tarball of the
+          # commit that contains it; this one is made from the checkout.
+          su builder -c 'cd pkg/arch && makepkg --noconfirm --skipchecksums'
 
       - uses: softprops/action-gh-release@v2
         with:
