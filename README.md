@@ -24,6 +24,7 @@ axon-cli -f <FILE> -n <NAME> --json       # print the full responses as JSON
 | `-n, --name NAME` | Request to run (repeatable): its name, or `#N` for the Nth request in the file (1-based, unnamed ones included); quote names with spaces: `-n "create item"` |
 | `-l, --list` | Print only the request names, as a JSON array of strings; an unnamed request is listed as its `#N` |
 | `--var NAME=VALUE` | Set a variable (repeatable), replacing any `@NAME = ...` in the file and its imports (see [Variables](#variables)) |
+| `--delay DURATION` | Wait this long after each response before sending the next request, e.g. `500ms`, `2s`, `1m` (a plain number is milliseconds); a request's `@delay` replaces it (see [Delays](#delays)) |
 | `--netrc-file PATH` | netrc file to read credentials from (default `~/.netrc`) |
 | `--no-follow` | Do not follow redirects |
 | `-j, --json` | Print each `-n` response as JSON (status, headers, cookies, body) instead of the headers and raw body |
@@ -87,6 +88,7 @@ Content-Type: application/json
 - PATH is relative to the directory of the `.http` file it is written in (as for `import`), absolute, or in the home directory with `~/` (`{{$file ~/.ssh/id_ed25519.pub}}`, using `$HOME`; `~user` is not supported); inside an imported file it is relative to that file, also when the variable is used from the importing file. Everything after `$file ` is the path, trimmed, so it is not quoted.
 - Trailing newlines are removed (like `$(cat PATH)` in a shell), so a token file ending in a newline works in a header; use filters for anything else (`{{$file name.txt | trim}}`).
 - The file must be UTF-8 text. A missing or unreadable file is an error (exit 1), reported before any request is sent, for the requests being run only.
+- To send a request once per line or JSON array element of a file, use it in a `@foreach`: see [Looping over a file](#looping-over-a-file).
 
 ### Imports
 
@@ -200,7 +202,7 @@ X-Name: {{user.name}}
 - `{{user}}` is the current element, and `{{user.id}}`, `{{user['first name']}}`, `{{user.tags[0]}}` are values inside it, inserted like other references. The loop variable is letters, digits, `_` and `-`, visible in its own request and in requests that follow it (below), not in file variables, and must not have the same name as a file variable or another loop variable.
 - An empty array sends nothing.
 - The default output prints every iteration; `-b` prints each iteration's body, back to back. With `--json`, a looping `-n` takes one slot holding a flat array of its iterations, so `-n "list users" -n "user details"` prints `[{...}, [{...}, {...}]]` and a single looping `-n` prints just the array (`[]` when empty). Each iteration has `"loop": {"user": 2}` with the index of each loop variable.
-- A `@foreach` must loop over a response body or a value inside an earlier loop variable, without filters, and a request can reference at most one looping request; these are reported before any request is sent. A value that is not an array, a missing `{{user...}}` value or a failed iteration stops the run with exit 1, naming the element: `request "user details" (element 2): ...`, or with several loop variables `request "domain details" (wc 2, domain 0): ...`.
+- A `@foreach` must loop over a response body, a file (see [Looping over a file](#looping-over-a-file)) or a value inside an earlier loop variable, without filters, and a request can reference at most one looping request; these are reported before any request is sent. A value that is not an array, a missing `{{user...}}` value or a failed iteration stops the run with exit 1, naming the element: `request "user details" (element 2): ...`, or with several loop variables `request "domain details" (wc 2, domain 0): ...`.
 
 #### Nested loops
 
@@ -236,6 +238,26 @@ GET {{sysapi}}/webconfigs/{{wc.id}}/domains/{{domain.id}}
 
 `-n "domain details"` fetches the domains of each webconfig, then the details of each of those domains, with `{{wc.id}}` the webconfig it came from. A request can follow a request that itself follows another. If an iteration fails an `@assert`, only the iterations that follow it are skipped: `SKIP request "domain details" (element 2): "domains per webconfig" (element 2) failed its checks`.
 
+#### Looping over a file
+
+`# @foreach VAR in {{$file PATH}}` loops over a file instead of a response, so nothing has to be fetched first:
+
+```http
+### item details
+# @foreach id in {{$file ids.txt}}
+GET {{base}}/items/{{id}}
+
+### user roles
+# @foreach user in {{$file users.json}}
+# @foreach role in {{user.roles}}
+PUT {{base}}/users/{{user.name}}/roles/{{role}}
+```
+
+- A `.json` file (any case) must hold a JSON array, whose elements are used like those of a response, objects included: `{{user.name}}`, and nested loops over `{{user.roles}}`.
+- Any other file is text: each line is an element, trimmed, skipping blank lines and lines starting with `#`.
+- PATH is found as for [`{{$file PATH}}`](#reading-files): relative to the `.http` file it is written in, absolute, or with `~/`.
+- The file is read before any request is sent; a missing file, invalid JSON or a JSON value that is not an array is an error (exit 1). An empty file sends nothing.
+
 #### Skipping iterations
 
 `# @skip-if CHECK` in a looping request skips the iterations where the check is true, like `continue`. It takes the same checks as [`@assert`](#checks), evaluated before sending, so it can use loop variables, `@let` variables and other responses, but not `{{response...}}`:
@@ -251,6 +273,26 @@ GET {{sysapi}}/brands/{{brand}}/clusters/{{cluster}}/webconfigs/{{wc.id}}
 - One true `@skip-if` is enough. A skipped iteration is not sent, printed or checked, and requests that follow the loop do not run for it; with `--json` it is left out, and the `"loop"` indexes of the others show the gap.
 - A value that cannot be read stops the run (exit 1), except with `exists` and `!exists`: `@skip-if {{wc.disabled}} exists`.
 - Only looping requests (with `@foreach`, or following a loop) can use it; this, an invalid line or `{{response...}}` in it is reported before any request is sent.
+
+### Delays
+
+`# @delay DURATION` before the request line waits after the request's response before the next request is sent, e.g. to stay under a rate limit in a loop or to give the server time after creating something:
+
+```http
+### create item
+# @delay 2s
+POST {{base}}/items
+
+### user details
+# @foreach user in {{list.response.body.$.users}}
+# @delay 250ms
+GET {{base}}/users/{{user.id}}
+```
+
+- DURATION is a number with `ms`, `s` or `m` (`500ms`, `1.5s`, `2m`); a plain number is milliseconds, and `0` means no wait.
+- In a loop it waits after each iteration. Nothing waits after the last request of the run, or for an iteration skipped by `@skip-if` (nothing was sent).
+- `--delay DURATION` waits after every request; a request's `@delay` replaces it (`# @delay 0` for none).
+- It can use variables, `@let` and loop variables, and other responses (`# @delay {{wait}}`, set with `--var wait=5s`; `# @delay {{create.response.headers.Retry-After}}s`), but not `{{response...}}`. A literal value is checked before any request is sent; one from `{{...}}` when it is used (exit 1 if invalid).
 
 ### Filters
 
@@ -380,6 +422,10 @@ axon-cli -f api.http -n "update profile" -b | jq .
 
 # Use the id from the Location header of "create item", which runs first
 axon-cli -f api.http -n "show item" -b | jq .
+
+# Fetch every item whose id is listed, one per line, in ids.txt
+# (# @foreach id in {{$file ids.txt}})
+axon-cli -f api.http -n "item details" -b
 
 # Fetch details for every user, collect the names
 axon-cli -f api.http -n "user details" --json | jq -r '.[].body | fromjson | .name'

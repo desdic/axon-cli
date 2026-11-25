@@ -653,6 +653,57 @@ fn var_option_replaces_file_variables() {
     );
 }
 
+// --- delays ----------------------------------------------------------------
+
+/// Runs `run` and returns how long it took.
+fn timed(run: impl FnOnce() -> Run) -> (Run, std::time::Duration) {
+    let start = std::time::Instant::now();
+    let r = run();
+    (r, start.elapsed())
+}
+
+#[test]
+fn delay_option_waits_between_requests() {
+    let base = start_server();
+    // `list` runs as a dependency, then `each` twice: two waits.
+    let (r, elapsed) = timed(|| {
+        run_file(
+            "delay-option",
+            &loops(&base),
+            &["-n", "each", "--delay", "300ms"],
+        )
+    });
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(elapsed.as_millis() >= 600, "{elapsed:?}");
+}
+
+#[test]
+fn delay_directive_waits_after_each_iteration_but_not_the_last_request() {
+    let base = start_server();
+    let contents = format!(
+        "### list\nGET {base}/list\n\n### each\n# @foreach user in {{{{list.response.body.$.users}}}}\n# @delay 1s\nGET {base}/json\n"
+    );
+    let (r, elapsed) = timed(|| run_file("delay-directive", &contents, &["-n", "each"]));
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    // Between the two iterations only, not after the second.
+    assert!((1000..1900).contains(&elapsed.as_millis()), "{elapsed:?}");
+}
+
+#[test]
+fn delay_directive_replaces_delay_option() {
+    let base = start_server();
+    let contents = format!("### a\n# @delay 0\nGET {base}/json\n\n### b\nGET {base}/json\n");
+    let (r, elapsed) = timed(|| {
+        run_file(
+            "delay-zero",
+            &contents,
+            &["-n", "a", "-n", "b", "--delay", "5s"],
+        )
+    });
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(elapsed.as_millis() < 3000, "{elapsed:?}");
+}
+
 // --- selecting requests ----------------------------------------------------
 
 #[test]
@@ -1050,6 +1101,52 @@ fn loop_runs_once_per_element() {
     assert_eq!(
         echo_field(&iterations[1], "x_test"),
         json!(["2-bob", r#"{"id":2,"name":"bob"}"#])
+    );
+}
+
+#[test]
+fn loop_over_file_lines_and_json() {
+    let base = start_server();
+    let dir = temp_dir("loop-file");
+    std::fs::write(dir.join("ids.txt"), "# ids\n7\n\n8\n").unwrap();
+    std::fs::write(
+        dir.join("users.json"),
+        r#"[{"name": "ann"}, {"name": "bob"}]"#,
+    )
+    .unwrap();
+    // Relative to the .http file, which http_file writes into the same dir.
+    let contents = format!(
+        "### ids\n# @foreach id in {{{{$file ids.txt}}}}\nGET {base}/json\nX-Test: {{{{id}}}}\n\n### users\n# @foreach user in {{{{$file users.json}}}}\nGET {base}/json\nX-Test: {{{{user.name}}}}\n"
+    );
+    let r = run_file("loop-file", &contents, &["-n", "ids", "-n", "users"]);
+
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let names = |slot: &Value| -> Vec<Value> {
+        slot.as_array()
+            .unwrap()
+            .iter()
+            .map(|it| echo_field(it, "x_test")[0].clone())
+            .collect()
+    };
+    assert_eq!(names(&r.stdout[0]), [json!("7"), json!("8")]);
+    assert_eq!(names(&r.stdout[1]), [json!("ann"), json!("bob")]);
+    assert_eq!(r.stdout[1][1]["loop"], json!({"user": 1}));
+}
+
+#[test]
+fn loop_file_errors_before_sending() {
+    // A missing file is reported before "first" is sent (it would fail to
+    // connect otherwise).
+    let r = run_file(
+        "loop-file-missing",
+        "### first\nGET http://127.0.0.1:1/\n\n### each\n# @foreach id in {{$file nope.txt}}\nGET http://127.0.0.1:1/{{id}}\n",
+        &["-n", "first", "-n", "each"],
+    );
+    assert_eq!(r.code, 1);
+    let error = r.stderr["error"].as_str().unwrap();
+    assert!(
+        error.starts_with("request \"each\": @foreach {{$file nope.txt}}: failed to read "),
+        "{error}"
     );
 }
 
